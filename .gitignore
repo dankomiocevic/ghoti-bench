@@ -1,0 +1,44 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+.DS_Store
+
+# Go workspace file
+go.work
+
+# Buids
+dist/
+
+# Credentials and keys. A secret that reaches the history has to be treated
+# as compromised and rotated, removing it from the history is not enough.
+*.pem
+*.key
+*.p12
+*.pfx
+*_rsa
+*_ed25519
+
+# Local configuration, it usually carries user and cluster passwords.
+# config.yaml is tracked as an example, keep real credentials out of it and
+# put them in the environment or in a config file outside the repository.
+config.tmp
+config_full.yaml
+config_local.*
+config.local.*
+.env
+.env.*
