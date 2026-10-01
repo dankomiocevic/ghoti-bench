@@ -42,3 +42,7 @@ config_local.*
 config.local.*
 .env
 .env.*
+
+# ghoti-bench
+bin/
+results/
