@@ -21,6 +21,7 @@ ghoti-bench run --ghoti-binary ./ghoti             # uses an existing binary
 ghoti-bench run --target 10.0.1.15:9090 --metrics-addr 10.0.1.15:9100 \
   --ghoti-version 0.2.0 --ghoti-commit 90b5271
 ghoti-bench scenarios                              # lists the scenarios
+ghoti-bench fetch --ghoti-ref v0.2.0 --os linux --arch arm64 --output ghoti
 ```
 
 ghoti-bench gets a server (release, commit or binary), starts a fresh one for
@@ -55,6 +56,42 @@ binds it, the start is retried on new ports. After every run the server must
 exit cleanly on SIGTERM: a server that crashed during the run, exited with an
 error or had to be killed stops the benchmark, because the next run would no
 longer be isolated.
+
+## Running on EC2
+
+`scripts/ec2-bench.sh` runs the benchmark on two EC2 instances in the default
+VPC: a Ghoti server (`t4g.micro` by default) and a bigger generator
+(`c7g.xlarge`), in the same subnet. It needs the AWS CLI v2 with credentials,
+Go, ssh and curl.
+
+```sh
+scripts/ec2-bench.sh                                     # full memory-read matrix, about 1 hour
+scripts/ec2-bench.sh --repetitions 1 --warmup 5s --duration 30s
+GHOTI_REF=90b5271 SERVER_TYPE=t3.micro GENERATOR_TYPE=c7i.xlarge scripts/ec2-bench.sh
+```
+
+The script:
+
+1. Cross-compiles ghoti-bench for the generator and gets Ghoti for the server
+   with `ghoti-bench fetch` (the verified release, or a build of the commit).
+2. Creates a temporary key pair and security group (SSH from your IP only,
+   Ghoti and metrics only between the two instances) and launches both
+   instances on Amazon Linux 2023 in one availability zone. T instances use
+   `unlimited` CPU credits (`T_CREDITS`) so the server is not throttled
+   halfway through.
+3. Starts Ghoti as a systemd unit with slots `000-099` and metrics enabled,
+   then runs `ghoti-bench run --target` on the generator, detached so a
+   dropped SSH connection does not stop it, and streams its log.
+4. Downloads `summary.csv`, the run JSONs, the benchmark log, the Ghoti
+   journal and config, the final metrics and both hosts' CPU and memory
+   details into `results/ec2-<timestamp>/`.
+5. Terminates the instances and deletes the security group and key pair, also
+   when it fails or is interrupted (partial results are downloaded first).
+   `KEEP=1` leaves everything running and prints the commands to remove it.
+
+Every resource is tagged `Project=ghoti-bench` and `RunId=ec2-<timestamp>`.
+Arguments are passed to `ghoti-bench run`. See the header of the script for
+every setting.
 
 ## Scenarios
 
