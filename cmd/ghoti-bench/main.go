@@ -311,9 +311,10 @@ func runOne(ctx context.Context, o *options, sc scenario.Scenario, bin *ghoti.Bi
 	spec.Meta = meta
 
 	cfg := ghoti.ServerConfig{
-		SimpleMemorySlots: sc.SlotList(),
-		LogLevel:          "warn",
-		GOMAXPROCS:        o.serverGOMAXPROCS,
+		Slots:      sc.SlotList(),
+		SlotKind:   sc.SlotKind(),
+		LogLevel:   "warn",
+		GOMAXPROCS: o.serverGOMAXPROCS,
 	}
 	// Every run gets a fresh server so no run inherits state, garbage or
 	// connections from the previous one.

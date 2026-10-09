@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,10 @@ import (
 
 // fakeGhoti is a minimal simple-memory server speaking the standard
 // protocol. corrupt makes every n-th read return a wrong value.
+//
+// With counters every slot is an atomic counter instead: a read increments
+// it, doubleEvery increments by two on every n-th read and staleEvery
+// answers every n-th read with the value before the increment.
 type fakeGhoti struct {
 	ln      net.Listener
 	mu      sync.Mutex
@@ -21,6 +26,11 @@ type fakeGhoti struct {
 	reads   atomic.Int64
 	corrupt int64
 	errorOn string // slot answered with an error response
+
+	counters    bool
+	values      map[string]int64
+	doubleEvery int64
+	staleEvery  int64
 }
 
 func startFake(t *testing.T) *fakeGhoti {
@@ -29,7 +39,7 @@ func startFake(t *testing.T) *fakeGhoti {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeGhoti{ln: ln, slots: map[string]string{}}
+	f := &fakeGhoti{ln: ln, slots: map[string]string{}, values: map[string]int64{}}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -62,13 +72,36 @@ func (f *fakeGhoti) serve(c net.Conn) {
 			fmt.Fprintf(c, "e%s004\n", slot)
 			continue
 		}
-		switch line[0] {
-		case 'w':
+		switch {
+		case f.counters && line[0] == 'w':
+			v, err := strconv.ParseInt(line[4:], 10, 64)
+			if err != nil || v < 0 {
+				fmt.Fprintf(c, "e%s007\n", slot)
+				continue
+			}
+			f.mu.Lock()
+			f.values[slot] = v
+			f.mu.Unlock()
+			fmt.Fprintf(c, "v%s%d\n", slot, v)
+		case f.counters && line[0] == 'r':
+			n := f.reads.Add(1)
+			f.mu.Lock()
+			f.values[slot]++
+			if f.doubleEvery > 0 && n%f.doubleEvery == 0 {
+				f.values[slot]++
+			}
+			v := f.values[slot]
+			f.mu.Unlock()
+			if f.staleEvery > 0 && n%f.staleEvery == 0 {
+				v--
+			}
+			fmt.Fprintf(c, "v%s%d\n", slot, v)
+		case line[0] == 'w':
 			f.mu.Lock()
 			f.slots[slot] = line[4:]
 			f.mu.Unlock()
 			fmt.Fprintf(c, "v%s%s\n", slot, line[4:])
-		case 'r':
+		case line[0] == 'r':
 			f.mu.Lock()
 			v := f.slots[slot]
 			f.mu.Unlock()
@@ -331,5 +364,96 @@ func TestReconnectBacksOff(t *testing.T) {
 	// 10+20+...+640ms is about 1.3s, so each worker fits under 10 attempts.
 	if res.Reconnects > 20 {
 		t.Fatalf("%d reconnects in 1s, backoff is not applied", res.Reconnects)
+	}
+}
+
+func counterConfig(f *fakeGhoti) Config {
+	f.counters = true
+	cfg := testConfig(f.ln.Addr().String())
+	cfg.Workload = WorkloadCounter
+	cfg.Slots = SlotRange{100, 109}
+	cfg.PayloadSize = 0
+	return cfg
+}
+
+func TestRunCounter(t *testing.T) {
+	f := startFake(t)
+	// Start from a value the preload has to reset.
+	f.values["100"] = 500
+	res, err := Run(context.Background(), counterConfig(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests == 0 || res.Errors.Total()+res.WarmupErrors.Total() != 0 {
+		t.Fatalf("requests %d errors %+v %+v", res.Requests, res.Errors, res.WarmupErrors)
+	}
+	c := res.CounterCheck
+	if c == nil || c.Failed() {
+		t.Fatalf("counter check %+v", c)
+	}
+	// The final check reads every slot once more.
+	if c.Increments < res.Requests || c.Increments+10 != uint64(f.reads.Load()) {
+		t.Fatalf("increments %d, requests %d, server reads %d", c.Increments, res.Requests, f.reads.Load())
+	}
+}
+
+func TestRunCounterDetectsDoubleIncrements(t *testing.T) {
+	f := startFake(t)
+	cfg := counterConfig(f)
+	f.doubleEvery = 100
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The values still grow, only the final check can see it.
+	if res.Errors.Total() != 0 {
+		t.Fatalf("errors %+v", res.Errors)
+	}
+	if c := res.CounterCheck; c == nil || len(c.Mismatches) == 0 {
+		t.Fatalf("counter check %+v", c)
+	}
+}
+
+func TestRunCounterRejectsValuesThatDoNotGrow(t *testing.T) {
+	f := startFake(t)
+	cfg := counterConfig(f)
+	cfg.Slots = SlotRange{100, 100}
+	cfg.Connections = 1
+	f.staleEvery = 50
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Errors.Incorrect+res.WarmupErrors.Incorrect == 0 {
+		t.Fatal("a value that did not grow was accepted")
+	}
+	if res.CounterCheck != nil {
+		t.Fatal("counters were checked after errors")
+	}
+}
+
+func TestPreloadRejectsSimpleMemoryForCounters(t *testing.T) {
+	f := startFake(t)
+	cfg := counterConfig(f)
+	f.counters = false
+	f.errorOn = "100"
+	_, err := Run(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "atomic") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestParseCounter(t *testing.T) {
+	prefix := []byte("v100")
+	good := map[string]int64{"v1000\n": 0, "v10042\n": 42, "v1009223372036854775807\n": 9223372036854775807}
+	for in, want := range good {
+		if got, ok := parseCounter([]byte(in), prefix); !ok || got != want {
+			t.Errorf("%q: got %d %v", in, got, ok)
+		}
+	}
+	for _, in := range []string{"v100\n", "v1001", "v1011\n", "v100-1\n", "v1001a\n", "v1009223372036854775808\n", "e100004\n"} {
+		if _, ok := parseCounter([]byte(in), prefix); ok {
+			t.Errorf("%q: expected rejection", in)
+		}
 	}
 }

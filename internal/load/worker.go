@@ -77,6 +77,12 @@ type worker struct {
 	// failed dials) since the last validated response, for the backoff.
 	failures    int
 	asyncEvents uint64
+
+	// For counters, the last value seen on each slot and the validated
+	// increments of each slot. The values a connection sees have to grow,
+	// and after the run the increments are checked against the counters.
+	counterLast  []int64
+	counterIncrs []uint64
 }
 
 func newHistogram(timeout time.Duration) *hdrhistogram.Histogram {
@@ -146,8 +152,14 @@ func (w *worker) run() {
 			continue
 		}
 
+		var ok bool
+		if o.counter {
+			ok = w.checkCounter(slot, o.response, resp)
+		} else {
+			ok = bytes.Equal(resp, o.response)
+		}
 		switch {
-		case bytes.Equal(resp, o.response):
+		case ok:
 		case len(resp) > 0 && resp[0] == 'e':
 			w.errorsAt(end).ErrorResponses++
 			continue
@@ -179,6 +191,19 @@ func (w *worker) run() {
 			return
 		}
 	}
+}
+
+// checkCounter validates a counter response. The counter is shared by every
+// connection, so the exact value is unknown, but this connection's reads are
+// sequential, so each value it sees has to be greater than the previous one.
+func (w *worker) checkCounter(slot int, prefix, resp []byte) bool {
+	v, ok := parseCounter(resp, prefix)
+	if !ok || v <= w.counterLast[slot] {
+		return false
+	}
+	w.counterLast[slot] = v
+	w.counterIncrs[slot]++
+	return true
 }
 
 // roundTrip writes one request and returns the next response line, skipping

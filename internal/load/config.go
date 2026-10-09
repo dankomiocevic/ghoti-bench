@@ -15,13 +15,15 @@ type Config struct {
 	// Connections is the number of persistent connections, each with one
 	// request in flight at a time.
 	Connections int
-	// Workload is WorkloadSimpleRead or WorkloadSimpleMixed.
+	// Workload is WorkloadSimpleRead, WorkloadSimpleMixed or WorkloadCounter.
 	Workload string
 	// ReadPercent is the share of reads for WorkloadSimpleMixed (0-100).
 	ReadPercent int
-	// Slots is the range of simple memory slots the workload uses.
+	// Slots is the range of slots the workload uses, of the kind given by
+	// SlotKind.
 	Slots SlotRange
-	// PayloadSize is the value size in bytes (1-36).
+	// PayloadSize is the value size in bytes (1-36). It is not used by
+	// WorkloadCounter, whose values are the counter.
 	PayloadSize int
 
 	Warmup   time.Duration
@@ -79,7 +81,7 @@ func (c *Config) Defaults() {
 	if c.SampleInterval == 0 {
 		c.SampleInterval = time.Second
 	}
-	if c.Workload == WorkloadSimpleRead {
+	if c.Workload == WorkloadSimpleRead || c.Workload == WorkloadCounter {
 		c.ReadPercent = 100
 	}
 }
@@ -94,11 +96,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("protocol %q not supported, use standard or telnet", c.Protocol)
 	case c.Connections < 1:
 		return errors.New("connections must be at least 1")
-	case c.Workload != WorkloadSimpleRead && c.Workload != WorkloadSimpleMixed:
-		return fmt.Errorf("workload %q not supported, use %s or %s", c.Workload, WorkloadSimpleRead, WorkloadSimpleMixed)
+	case c.Workload != WorkloadSimpleRead && c.Workload != WorkloadSimpleMixed && c.Workload != WorkloadCounter:
+		return fmt.Errorf("workload %q not supported, use %s, %s or %s", c.Workload, WorkloadSimpleRead, WorkloadSimpleMixed, WorkloadCounter)
 	case c.ReadPercent < 0 || c.ReadPercent > 100:
 		return errors.New("read-percent must be between 0 and 100")
-	case c.PayloadSize < 1 || c.PayloadSize > MaxValueSize:
+	case c.Workload != WorkloadCounter && (c.PayloadSize < 1 || c.PayloadSize > MaxValueSize):
 		return fmt.Errorf("payload-size must be between 1 and %d bytes", MaxValueSize)
 	case c.Slots.Len() < 1:
 		return errors.New("slots range is empty")
@@ -149,5 +151,10 @@ func (c *Config) RequestPattern() string {
 }
 
 // ResponseWireBytes is the size of a value response including its prefix
-// and terminator.
-func (c *Config) ResponseWireBytes() int { return 1 + 3 + c.PayloadSize + 1 }
+// and terminator. It is 0 for counters, whose responses grow with the value.
+func (c *Config) ResponseWireBytes() int {
+	if c.Workload == WorkloadCounter {
+		return 0
+	}
+	return 1 + 3 + c.PayloadSize + 1
+}

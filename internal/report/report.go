@@ -119,8 +119,10 @@ type ResultInfo struct {
 	Reconnects             uint64           `json:"reconnects"`
 	AsyncEvents            uint64           `json:"asyncEvents"`
 	Interrupted            bool             `json:"interrupted"`
-	Valid                  bool             `json:"valid"`
-	InvalidReasons         []string         `json:"invalidReasons,omitempty"`
+	// CounterCheck is only set for counter workloads without errors.
+	CounterCheck   *load.CounterCheck `json:"counterCheck,omitempty"`
+	Valid          bool               `json:"valid"`
+	InvalidReasons []string           `json:"invalidReasons,omitempty"`
 }
 
 type Latency struct {
@@ -198,6 +200,7 @@ func Build(meta Meta, cfg load.Config, res *load.Result, server serverstats.Summ
 		Reconnects:             res.Reconnects,
 		AsyncEvents:            res.AsyncEvents,
 		Interrupted:            res.Interrupted,
+		CounterCheck:           res.CounterCheck,
 	}
 	if total := res.Requests + errs; total > 0 {
 		r.Result.ErrorRate = float64(errs) / float64(total)
@@ -236,6 +239,14 @@ func invalidReasons(res *load.Result, server serverstats.Summary, maxGenCPU floa
 	}
 	if n := res.WarmupErrors.Total() + res.LateErrors.Total(); n > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d errors outside the measurement window", n))
+	}
+	if c := res.CounterCheck; c != nil && c.Failed() {
+		if c.Error != "" {
+			reasons = append(reasons, "counters could not be checked: "+c.Error)
+		}
+		for _, m := range c.Mismatches {
+			reasons = append(reasons, "counter mismatch, "+m)
+		}
 	}
 	if res.GeneratorCPUMaxPct > maxGenCPU {
 		reasons = append(reasons, fmt.Sprintf("generator CPU peaked at %.1f%% (limit %.0f%%), the generator may be the bottleneck", res.GeneratorCPUMaxPct, maxGenCPU))

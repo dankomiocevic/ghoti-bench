@@ -121,3 +121,19 @@ func TestBuildConnectionsDroppedDuringMeasurement(t *testing.T) {
 		t.Fatalf("reasons %v", r.Result.InvalidReasons)
 	}
 }
+
+func TestBuildCounterCheck(t *testing.T) {
+	r := sampleRun(t, func(res *load.Result) {
+		res.CounterCheck = &load.CounterCheck{Increments: 1200}
+	})
+	if !r.Result.Valid || r.Result.CounterCheck == nil {
+		t.Fatalf("passed counter check: valid %v, check %+v", r.Result.Valid, r.Result.CounterCheck)
+	}
+
+	r = sampleRun(t, func(res *load.Result) {
+		res.CounterCheck = &load.CounterCheck{Increments: 1200, Mismatches: []string{"slot 100: 1200 increments validated, counter at 1199"}}
+	})
+	if r.Result.Valid || !strings.Contains(strings.Join(r.Result.InvalidReasons, ";"), "counter mismatch, slot 100") {
+		t.Fatalf("failed counter check: valid %v, reasons %v", r.Result.Valid, r.Result.InvalidReasons)
+	}
+}

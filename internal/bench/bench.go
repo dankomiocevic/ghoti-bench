@@ -113,6 +113,9 @@ func printSummary(w io.Writer, r *report.Run) {
 		fmt.Fprintf(w, "  server conns %.0f", *s.ConnectionsMax)
 	}
 	fmt.Fprintln(w)
+	if c := r.Result.CounterCheck; c != nil && !c.Failed() {
+		fmt.Fprintf(w, "  counters match the %d validated increments\n", c.Increments)
+	}
 	if r.Result.Valid {
 		fmt.Fprintln(w, "  valid")
 	} else {

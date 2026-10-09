@@ -17,8 +17,10 @@ import (
 type ServerConfig struct {
 	Addr        string
 	MetricsAddr string
-	// SimpleMemorySlots lists the slots configured as simple_memory.
-	SimpleMemorySlots []int
+	// Slots lists the slots to configure, all of kind SlotKind.
+	Slots []int
+	// SlotKind is the Ghoti slot kind, simple_memory when empty.
+	SlotKind string
 	// LogLevel should stay at warn or error so logging does not distort
 	// the measurement.
 	LogLevel string
@@ -38,8 +40,12 @@ func (c ServerConfig) YAML() string {
 	if c.MetricsAddr != "" {
 		fmt.Fprintf(&b, "metrics:\n  enabled: true\n  addr: %q\n", c.MetricsAddr)
 	}
-	for _, s := range c.SimpleMemorySlots {
-		fmt.Fprintf(&b, "slot_%03d:\n  kind: simple_memory\n", s)
+	kind := c.SlotKind
+	if kind == "" {
+		kind = "simple_memory"
+	}
+	for _, s := range c.Slots {
+		fmt.Fprintf(&b, "slot_%03d:\n  kind: %s\n", s, kind)
 	}
 	return b.String()
 }

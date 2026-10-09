@@ -1,4 +1,4 @@
-.PHONY: build test memory-read
+.PHONY: build test memory-read counters
 
 build:
 	go build -o bin/ ./cmd/...
@@ -10,3 +10,8 @@ test:
 # 5 minute measurement, three repetitions (about 55 minutes).
 memory-read: build
 	./bin/ghoti-bench run --scenario memory-read --ghoti-ref $(or $(REF),v0.2.0)
+
+# Both counter benchmarks with the full matrix (about 2 hours).
+counters: build
+	./bin/ghoti-bench run --scenario counter-hot --ghoti-ref $(or $(REF),v0.2.0)
+	./bin/ghoti-bench run --scenario counter-spread --ghoti-ref $(or $(REF),v0.2.0)

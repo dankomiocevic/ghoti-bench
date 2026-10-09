@@ -47,7 +47,9 @@ Defaults run the full matrix: `--connections 1,100,1000`, `--repetitions 3`,
 the host spreads over every connection count.
 
 With `--target` the server is not started or restarted by ghoti-bench, so
-it must already have the scenario slots configured as `simple_memory`. Ghoti
+it must already have the scenario slots configured with the kind the scenario
+needs: `simple_memory` for the memory scenarios and `atomic` for the counter
+scenarios. Ghoti
 cannot be asked for its version over the network, so pass `--ghoti-version`
 and `--ghoti-commit` to record which Ghoti was measured.
 
@@ -68,7 +70,16 @@ Go, ssh and curl.
 scripts/ec2-bench.sh                                     # full memory-read matrix, about 1 hour
 scripts/ec2-bench.sh --repetitions 1 --warmup 5s --duration 30s
 GHOTI_REF=90b5271 SERVER_TYPE=t3.micro GENERATOR_TYPE=c7i.xlarge scripts/ec2-bench.sh
+SCENARIOS="memory-read memory-mixed" scripts/ec2-bench.sh
+scripts/ec2-counter-bench.sh                             # counter-hot and counter-spread, about 2 hours
 ```
+
+`SCENARIOS` runs several scenarios one after the other on the same instances,
+which is cheaper than starting new ones for each and keeps the hardware the
+same for all of them. Each scenario is written to its own directory,
+`results/ec2-<timestamp>/<scenario>/`, and the first one that fails stops the
+rest. `scripts/ec2-counter-bench.sh` is `ec2-bench.sh` with `SCENARIOS` set to
+the counter scenarios, and takes the same settings and arguments.
 
 The script:
 
@@ -79,7 +90,9 @@ The script:
    instances on Amazon Linux 2023 in one availability zone. T instances use
    `unlimited` CPU credits (`T_CREDITS`) so the server is not throttled
    halfway through.
-3. Starts Ghoti as a systemd unit with slots `000-099` and metrics enabled,
+3. Starts Ghoti as a systemd unit with simple memory slots `000-099`, atomic
+   counter slots `100-199` and metrics enabled, so one server can run every
+   scenario,
    then runs `ghoti-bench run --target` on the generator, detached so a
    dropped SSH connection does not stop it, and streams its log.
 4. Downloads `summary.csv`, the run JSONs, the benchmark log, the Ghoti
@@ -115,6 +128,36 @@ write to a slot stores the value it was preloaded with, so every response,
 read or write, is still validated exactly while the server does the full
 write path.
 
+### counter-hot
+
+Every connection increments the same atomic counter, slot `100`.
+
+1. Slot `100` is set to `0` before the run.
+2. Each connection repeatedly sends `r100\n`, which increments the counter and
+   returns the new value.
+3. The value is shared by every connection, so it cannot be known exactly in
+   advance. A connection only has one request in flight and Ghoti increments
+   the counter under a lock, so every value a connection reads has to be
+   greater than the previous one it read. A value that does not grow is
+   counted as an incorrect response.
+4. After the run, if there were no errors, the counter is read once more. It
+   has to hold exactly the number of increments the generator validated: a
+   lower value means increments were lost and a higher one that some were
+   applied twice. A mismatch makes the run invalid.
+
+It measures how the counter behaves when every connection contends for the
+same slot.
+
+### counter-spread
+
+The same as `counter-hot` over slots `100-199`, slot chosen uniformly. With
+100 slots there is little contention on any one of them, so comparing it with
+`counter-hot` shows how much the contention on a single slot costs.
+
+Counters only use reads. A write sets the counter to an absolute value, which
+would make the values a connection reads jump backwards and the final check
+impossible.
+
 ## Method
 
 - **Closed loop.** One request in flight per connection, as the Ghoti
@@ -141,7 +184,8 @@ write path.
   `ghoti_requests_total` is kept as a cross-check of the generator count.
 - **Validity.** A run is `valid` only if every connection was established,
   there were no errors at all (warm-up included), it was not interrupted, the
-  server reported every connection for the whole measurement, and the generator CPU stayed under
+  server reported every connection for the whole measurement, the counters
+  matched the validated increments (counter scenarios), and the generator CPU stayed under
   `--max-generator-cpu` (80%). Past that the generator may be what is being
   measured. The reasons are listed in `run.json`. The table printed at the
   end aggregates only valid runs (`N/A` when there are none) and lists the
@@ -168,7 +212,7 @@ run_id,timestamp,scenario,server_instance,generators,connections,duration_s,tota
 ```
 
 Server columns are empty when they could not be collected. `run.json` adds the
-error breakdown, reads and writes, p90, mean and stddev, generator CPU and
+error breakdown, reads and writes, the counter check, p90, mean and stddev, generator CPU and
 network peak (application bytes), the Ghoti version and commit, the per-second
 load and server timelines, and the reasons for an invalid run. Nothing is
 written per request.
