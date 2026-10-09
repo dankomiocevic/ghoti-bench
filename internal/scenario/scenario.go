@@ -37,6 +37,23 @@ var all = map[string]Scenario{
 		Slots:       load.SlotRange{First: 0, Last: 99},
 		PayloadSize: 36,
 	},
+	// The counters use slots 100-199 so one server configured with simple
+	// memory slots 000-099 and atomic slots 100-199 can run every scenario.
+	"counter-hot": {
+		Name: "counter-hot",
+		Description: "Every connection increments atomic counter slot 100 and validates the value. " +
+			"Measures the read path when all connections contend for the same slot.",
+		Workload:    load.WorkloadCounter,
+		ReadPercent: 100,
+		Slots:       load.SlotRange{First: 100, Last: 100},
+	},
+	"counter-spread": {
+		Name:        "counter-spread",
+		Description: "Increments atomic counter slots 100-199, slot chosen uniformly, and validates every value.",
+		Workload:    load.WorkloadCounter,
+		ReadPercent: 100,
+		Slots:       load.SlotRange{First: 100, Last: 199},
+	},
 }
 
 // Get returns a scenario by name.
@@ -57,6 +74,9 @@ func Names() []string {
 	sort.Strings(names)
 	return names
 }
+
+// SlotKind is the Ghoti slot kind the scenario slots need.
+func (s Scenario) SlotKind() string { return load.SlotKind(s.Workload) }
 
 // SlotList expands the scenario slots for the server configuration.
 func (s Scenario) SlotList() []int {

@@ -75,7 +75,7 @@ func testServer(t *testing.T, mode string) (*Binary, string) {
 
 func TestStartOnFreePortsAndStop(t *testing.T) {
 	bin, dir := testServer(t, "")
-	s, err := StartOnFreePorts(context.Background(), bin, ServerConfig{SimpleMemorySlots: []int{0}}, dir)
+	s, err := StartOnFreePorts(context.Background(), bin, ServerConfig{Slots: []int{0}}, dir)
 	if err != nil {
 		t.Fatal(err)
 	}

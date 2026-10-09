@@ -62,11 +62,32 @@ type Result struct {
 	AsyncEvents  uint64
 	Interrupted  bool
 
+	// CounterCheck is the end of run check of a counter workload, nil when
+	// it did not run.
+	CounterCheck *CounterCheck
+
 	Timeline           []Sample
 	GeneratorCPUAvgPct float64
 	GeneratorCPUMaxPct float64
 	NetworkPeakMbps    float64
 }
+
+// CounterCheck compares the final value of every counter with the increments
+// the generator validated. Every counter was preloaded with 0, so after the
+// run it has to hold exactly the number of increments: a lower value means
+// increments were lost, a higher one that some were applied twice.
+type CounterCheck struct {
+	// Increments is the number of validated increments over every slot,
+	// warm-up included.
+	Increments uint64 `json:"increments"`
+	// Mismatches describes every slot whose value did not match.
+	Mismatches []string `json:"mismatches,omitempty"`
+	// Error is set when the counters could not be read back.
+	Error string `json:"error,omitempty"`
+}
+
+// Failed reports whether the check found a problem.
+func (c *CounterCheck) Failed() bool { return len(c.Mismatches) > 0 || c.Error != "" }
 
 // Run executes a closed-loop load run. It preloads the slots, opens every
 // connection, runs the warm-up and the measurement, and returns the merged
@@ -77,7 +98,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		return nil, err
 	}
 
-	plan := buildOps(cfg.Slots, cfg.PayloadSize, cfg.terminator())
+	plan := buildOps(cfg.Workload, cfg.Slots, cfg.PayloadSize, cfg.terminator())
 	if !cfg.SkipPreload {
 		if err := preload(&cfg, &plan); err != nil {
 			return nil, fmt.Errorf("preloading slots: %w", err)
@@ -108,6 +129,17 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 			measureEnd:   res.MeasureEnd,
 			stop:         &stop,
 			hist:         newHistogram(cfg.RequestTimeout),
+		}
+		if cfg.Workload == WorkloadCounter {
+			w.counterLast = make([]int64, cfg.Slots.Len())
+			w.counterIncrs = make([]uint64, cfg.Slots.Len())
+			if cfg.SkipPreload {
+				// The starting values are unknown, any value is accepted
+				// first.
+				for s := range w.counterLast {
+					w.counterLast[s] = -1
+				}
+			}
 		}
 		w.attach(conn)
 		workers[i] = w
@@ -145,7 +177,73 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	<-samplerDone
 
 	merge(res, workers, &cfg, &tl)
+	// Any error leaves the counters unknown: a request that timed out may
+	// still have incremented its slot.
+	if cfg.Workload == WorkloadCounter && !cfg.SkipPreload && res.Errors.Total()+res.WarmupErrors.Total()+res.LateErrors.Total() == 0 {
+		res.CounterCheck = checkCounters(&cfg, workers)
+	}
 	return res, nil
+}
+
+// checkCounters reads every counter once after the run. The read itself
+// increments the counter, so it has to return the validated increments
+// plus one.
+func checkCounters(cfg *Config, workers []*worker) *CounterCheck {
+	n := cfg.Slots.Len()
+	incrs := make([]uint64, n)
+	check := &CounterCheck{}
+	for _, w := range workers {
+		for s, c := range w.counterIncrs {
+			incrs[s] += c
+			check.Increments += c
+		}
+	}
+
+	conn, err := dial(cfg.Addr, cfg.DialTimeout)
+	if err != nil {
+		check.Error = err.Error()
+		return check
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(cfg.RequestTimeout + time.Duration(n)*100*time.Millisecond))
+
+	r := bufio.NewReader(conn)
+	term := cfg.terminator()
+	for s := range n {
+		slot := cfg.Slots.First + s
+		if _, err := fmt.Fprintf(conn, "r%03d%s", slot, term); err != nil {
+			check.Error = err.Error()
+			return check
+		}
+		line, err := readResponse(r)
+		if err != nil {
+			check.Error = err.Error()
+			return check
+		}
+		got, ok := parseCounter(line, fmt.Appendf(nil, "v%03d", slot))
+		if !ok {
+			check.Error = fmt.Sprintf("slot %03d answered %q", slot, bytes.TrimSpace(line))
+			return check
+		}
+		if want := incrs[s] + 1; uint64(got) != want {
+			check.Mismatches = append(check.Mismatches,
+				fmt.Sprintf("slot %03d: %d increments validated, counter at %d", slot, incrs[s], got-1))
+		}
+	}
+	return check
+}
+
+// readResponse returns the next response line, skipping async events.
+func readResponse(r *bufio.Reader) ([]byte, error) {
+	for {
+		line, err := r.ReadSlice('\n')
+		if err != nil {
+			return nil, err
+		}
+		if line[0] != 'a' {
+			return line, nil
+		}
+	}
 }
 
 func merge(res *Result, workers []*worker, cfg *Config, tl *timeline) {
@@ -202,19 +300,13 @@ func preload(cfg *Config, plan *ops) error {
 		if _, err := conn.Write(o.request); err != nil {
 			return err
 		}
-		for {
-			line, err := r.ReadSlice('\n')
-			if err != nil {
-				return err
-			}
-			if line[0] == 'a' {
-				continue
-			}
-			if !bytes.Equal(line, o.response) {
-				return fmt.Errorf("request %q answered %q, expected %q; is the slot a simple_memory slot?",
-					bytes.TrimSpace(o.request), bytes.TrimSpace(line), bytes.TrimSpace(o.response))
-			}
-			break
+		line, err := readResponse(r)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(line, o.response) {
+			return fmt.Errorf("request %q answered %q, expected %q; is the slot a %s slot?",
+				bytes.TrimSpace(o.request), bytes.TrimSpace(line), bytes.TrimSpace(o.response), SlotKind(cfg.Workload))
 		}
 	}
 	return nil
