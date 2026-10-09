@@ -31,6 +31,7 @@ import (
 const usage = `Usage:
   ghoti-bench run (--ghoti-ref REF | --ghoti-binary PATH | --target HOST:PORT) [flags]
   ghoti-bench scenarios
+  ghoti-bench fetch --ghoti-ref REF [--os linux --arch arm64] [--output PATH]
 
 Examples:
   ghoti-bench run --ghoti-ref v0.2.0
@@ -56,6 +57,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "ghoti-bench:", err)
 			os.Exit(1)
 		}
+	case "fetch":
+		if err := fetch(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ghoti-bench:", err)
+			os.Exit(1)
+		}
 	case "scenarios":
 		for _, n := range scenario.Names() {
 			s, _ := scenario.Get(n)
@@ -65,6 +71,45 @@ func main() {
 		printUsage()
 		os.Exit(2)
 	}
+}
+
+// fetch resolves a Ghoti binary, possibly for another platform, and copies it
+// to --output. It prints the version and commit as key=value lines so scripts
+// can record them, for example when the server runs on another host.
+func fetch(args []string) error {
+	fs := flag.NewFlagSet("ghoti-bench fetch", flag.ContinueOnError)
+	ref := fs.String("ghoti-ref", "", "release tag or commit")
+	repo := fs.String("ghoti-repo", ghoti.DefaultRepo, "Ghoti git repository URL or local path")
+	cacheDir := fs.String("cache-dir", ghoti.DefaultCacheDir(), "cache for releases, sources and builds")
+	build := fs.Bool("build", false, "build from source even if a release exists")
+	goos := fs.String("os", runtime.GOOS, "target operating system")
+	goarch := fs.String("arch", runtime.GOARCH, "target architecture")
+	output := fs.String("output", "", "copy the binary here (default: only print its cached path)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *ref == "" {
+		return errors.New("--ghoti-ref is required")
+	}
+	bin, err := ghoti.Resolve(context.Background(), *ref, ghoti.ResolveOptions{
+		Repo: *repo, CacheDir: *cacheDir, ForceBuild: *build, OS: *goos, Arch: *goarch, Log: os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	path := bin.Path
+	if *output != "" {
+		data, err := os.ReadFile(bin.Path)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(*output, data, 0o755); err != nil {
+			return err
+		}
+		path = *output
+	}
+	fmt.Printf("path=%s\nversion=%s\ncommit=%s\nsource=%s\n", path, bin.Version, bin.Commit, bin.Source)
+	return nil
 }
 
 func printUsage() {

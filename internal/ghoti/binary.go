@@ -44,7 +44,12 @@ type ResolveOptions struct {
 	CacheDir string
 	// ForceBuild builds from source even when a release archive exists.
 	ForceBuild bool
-	Log        io.Writer
+	// OS and Arch select the target platform, the local one when empty. A
+	// binary for another platform cannot be run to read its version, so it
+	// is taken from the tag or the build instead.
+	OS   string
+	Arch string
+	Log  io.Writer
 }
 
 func (o *ResolveOptions) logf(format string, args ...any) {
@@ -87,6 +92,12 @@ func Resolve(ctx context.Context, ref string, o ResolveOptions) (*Binary, error)
 	if o.CacheDir == "" {
 		o.CacheDir = DefaultCacheDir()
 	}
+	if o.OS == "" {
+		o.OS = runtime.GOOS
+	}
+	if o.Arch == "" {
+		o.Arch = runtime.GOARCH
+	}
 
 	if tagPattern.MatchString(ref) && !o.ForceBuild && isGitHub(o.Repo) {
 		b, err := downloadRelease(ctx, ref, o)
@@ -103,15 +114,16 @@ func isGitHub(repo string) bool { return strings.HasPrefix(repo, "https://github
 // downloadRelease fetches ghoti_<version>_<os>_<arch>.tar.gz, verifies it
 // against checksums.txt and extracts the binary.
 func downloadRelease(ctx context.Context, tag string, o ResolveOptions) (*Binary, error) {
-	dir := filepath.Join(o.CacheDir, "releases", tag, runtime.GOOS+"_"+runtime.GOARCH)
+	dir := filepath.Join(o.CacheDir, "releases", tag, o.OS+"_"+o.Arch)
 	bin := filepath.Join(dir, "ghoti")
+	version := strings.TrimPrefix(tag, "v")
 	if _, err := os.Stat(bin); err == nil {
 		o.logf("using cached release %s\n", bin)
-		return finish(ctx, bin, tag, "release")
+		return finish(ctx, bin, tag, "release", o, version, "")
 	}
 
 	base := strings.TrimSuffix(strings.TrimSuffix(o.Repo, "/"), ".git") + "/releases/download/" + tag + "/"
-	archive := fmt.Sprintf("ghoti_%s_%s_%s.tar.gz", strings.TrimPrefix(tag, "v"), runtime.GOOS, runtime.GOARCH)
+	archive := fmt.Sprintf("ghoti_%s_%s_%s.tar.gz", version, o.OS, o.Arch)
 
 	o.logf("downloading %s%s\n", base, archive)
 	sums, err := fetch(ctx, base+"checksums.txt")
@@ -137,7 +149,7 @@ func downloadRelease(ctx context.Context, tag string, o ResolveOptions) (*Binary
 	if err := extractFile(bytes.NewReader(data), "ghoti", bin); err != nil {
 		return nil, err
 	}
-	return finish(ctx, bin, tag, "release")
+	return finish(ctx, bin, tag, "release", o, version, "")
 }
 
 func fetch(ctx context.Context, url string) ([]byte, error) {
@@ -228,10 +240,10 @@ func build(ctx context.Context, ref string, o ResolveOptions) (*Binary, error) {
 		}
 	}
 
-	bin := filepath.Join(o.CacheDir, "builds", commit, "ghoti")
+	bin := filepath.Join(o.CacheDir, "builds", commit, o.OS+"_"+o.Arch, "ghoti")
 	if _, err := os.Stat(bin); err == nil {
 		o.logf("using cached build %s\n", bin)
-		return finish(ctx, bin, ref, "build")
+		return finish(ctx, bin, ref, "build", o, ref, commit[:12])
 	}
 
 	work, err := os.MkdirTemp("", "ghoti-build-")
@@ -249,11 +261,11 @@ func build(ctx context.Context, ref string, o ResolveOptions) (*Binary, error) {
 	}
 	const appinfo = "github.com/dankomiocevic/ghoti/internal/appinfo"
 	ldflags := fmt.Sprintf("-s -w -X %s.Version=%s -X %s.Commit=%s", appinfo, ref, appinfo, commit[:12])
-	env := append(os.Environ(), "CGO_ENABLED=0")
+	env := append(os.Environ(), "CGO_ENABLED=0", "GOOS="+o.OS, "GOARCH="+o.Arch)
 	if err := runCmd(ctx, work, env, "go", "build", "-trimpath", "-ldflags", ldflags, "-o", bin, "./cmd/ghoti"); err != nil {
 		return nil, err
 	}
-	return finish(ctx, bin, ref, "build")
+	return finish(ctx, bin, ref, "build", o, ref, commit[:12])
 }
 
 func gitArchive(ctx context.Context, repo, commit, dst string) error {
@@ -304,9 +316,16 @@ func gitArchive(ctx context.Context, repo, commit, dst string) error {
 	return cmd.Wait()
 }
 
-func finish(ctx context.Context, bin, ref, source string) (*Binary, error) {
-	b := &Binary{Path: bin, Ref: ref, Source: source}
-	b.Version, b.Commit = readVersion(ctx, bin)
+// finish describes the binary. A local binary reports its own version; one
+// built for another platform cannot run here, so the version and commit known
+// from the tag or the build are used.
+func finish(ctx context.Context, bin, ref, source string, o ResolveOptions, version, commit string) (*Binary, error) {
+	b := &Binary{Path: bin, Ref: ref, Source: source, Version: version, Commit: commit}
+	if o.OS == runtime.GOOS && o.Arch == runtime.GOARCH {
+		if v, c := readVersion(ctx, bin); v != "" {
+			b.Version, b.Commit = v, c
+		}
+	}
 	return b, nil
 }
 
