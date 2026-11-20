@@ -104,7 +104,7 @@ Counters and token buckets cannot be validated byte by byte, because their value
 3. Run the command of the session you want to repeat. The script creates both instances, runs the benchmark, downloads everything to `results/ec2-<timestamp>/` and deletes every resource it created, also when it fails. A full memory matrix takes about an hour, the 30 second slot runs a few minutes each.
 4. Compare your `summary.csv` with the table above. Single connection numbers depend on the network between the two instances you get, see [Single connections](#single-connections).
 
-`scripts/ec2-token-bucket-bench.sh` is still in an open pull request and only exists on its branch until it merges. To try a scenario on your own machine, `ghoti-bench run --ghoti-ref v0.3.0 --scenario counter-hot` starts the server itself, but numbers from one host are only good for comparing commits.
+To try a scenario on your own machine, `ghoti-bench run --ghoti-ref v0.3.0 --scenario counter-hot` starts the server itself, but numbers from one host are only good for comparing commits.
 
 ### v0.2.0 on t4g.micro
 
