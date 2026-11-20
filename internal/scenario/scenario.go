@@ -3,9 +3,12 @@ package scenario
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/dankomiocevic/ghoti-bench/internal/ghoti"
 	"github.com/dankomiocevic/ghoti-bench/internal/load"
 )
 
@@ -17,6 +20,8 @@ type Scenario struct {
 	ReadPercent int
 	Slots       load.SlotRange
 	PayloadSize int
+	// Bucket is the configuration of the token bucket slots.
+	Bucket load.TokenBucket
 }
 
 var all = map[string]Scenario{
@@ -54,6 +59,27 @@ var all = map[string]Scenario{
 		ReadPercent: 100,
 		Slots:       load.SlotRange{First: 100, Last: 199},
 	},
+	// Every bucket holds two periods of tokens, so an uneven spread of the
+	// requests does not throw refills away. The rates are low enough for a
+	// single connection to keep every bucket drained on EC2 (about 3,000
+	// requests per second), which the lower bound of the check needs.
+	"token-bucket-hot": {
+		Name: "token-bucket-hot",
+		Description: "Every connection takes tokens from token bucket slot 200 (1,000 tokens per second) and " +
+			"checks the tokens granted. Measures the rate limiter when all connections contend for the same slot.",
+		Workload:    load.WorkloadTokenBucket,
+		ReadPercent: 100,
+		Slots:       load.SlotRange{First: 200, Last: 200},
+		Bucket:      load.TokenBucket{Size: 2000, RefreshRate: 1000, TokensPerReq: 1, Period: "second"},
+	},
+	"token-bucket-spread": {
+		Name:        "token-bucket-spread",
+		Description: "Takes tokens from token bucket slots 300-399 (10 tokens per second each), slot chosen uniformly.",
+		Workload:    load.WorkloadTokenBucket,
+		ReadPercent: 100,
+		Slots:       load.SlotRange{First: 300, Last: 399},
+		Bucket:      load.TokenBucket{Size: 20, RefreshRate: 10, TokensPerReq: 1, Period: "second"},
+	},
 }
 
 // Get returns a scenario by name.
@@ -75,14 +101,47 @@ func Names() []string {
 	return names
 }
 
-// SlotKind is the Ghoti slot kind the scenario slots need.
-func (s Scenario) SlotKind() string { return load.SlotKind(s.Workload) }
-
-// SlotList expands the scenario slots for the server configuration.
-func (s Scenario) SlotList() []int {
-	slots := make([]int, 0, s.Slots.Len())
+// ServerSlots returns the slots the server needs for the scenario.
+func (s Scenario) ServerSlots() []ghoti.Slot {
+	kind := load.SlotKind(s.Workload)
+	var options []ghoti.Option
+	if s.Workload == load.WorkloadTokenBucket {
+		options = []ghoti.Option{
+			{Key: "bucket_size", Value: strconv.Itoa(s.Bucket.Size)},
+			{Key: "refresh_rate", Value: strconv.Itoa(s.Bucket.RefreshRate)},
+			{Key: "tokens_per_req", Value: strconv.Itoa(s.Bucket.TokensPerReq)},
+			{Key: "period", Value: s.Bucket.Period},
+		}
+	}
+	slots := make([]ghoti.Slot, 0, s.Slots.Len())
 	for i := s.Slots.First; i <= s.Slots.Last; i++ {
-		slots = append(slots, i)
+		slots = append(slots, ghoti.Slot{Number: i, Kind: kind, Options: options})
 	}
 	return slots
+}
+
+// AllServerSlots returns the slots of every scenario, for a server that has
+// to run all of them. Scenarios may share a slot only when they need the
+// same configuration for it.
+func AllServerSlots() ([]ghoti.Slot, error) {
+	bySlot := map[int]ghoti.Slot{}
+	owner := map[int]string{}
+	for _, name := range Names() {
+		for _, slot := range all[name].ServerSlots() {
+			if prev, ok := bySlot[slot.Number]; ok {
+				if !slices.Equal(prev.Options, slot.Options) || prev.Kind != slot.Kind {
+					return nil, fmt.Errorf("slot %03d is configured differently by %s and %s", slot.Number, owner[slot.Number], name)
+				}
+				continue
+			}
+			bySlot[slot.Number] = slot
+			owner[slot.Number] = name
+		}
+	}
+	slots := make([]ghoti.Slot, 0, len(bySlot))
+	for _, s := range bySlot {
+		slots = append(slots, s)
+	}
+	slices.SortFunc(slots, func(a, b ghoti.Slot) int { return a.Number - b.Number })
+	return slots, nil
 }

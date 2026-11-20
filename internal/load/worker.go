@@ -83,6 +83,11 @@ type worker struct {
 	// and after the run the increments are checked against the counters.
 	counterLast  []int64
 	counterIncrs []uint64
+	// For token buckets, the validated reads and the tokens granted on each
+	// slot over the whole run, and the tokens granted in the measurement.
+	bucketReqs     []uint64
+	bucketTokens   []uint64
+	measuredTokens uint64
 }
 
 func newHistogram(timeout time.Duration) *hdrhistogram.Histogram {
@@ -153,9 +158,13 @@ func (w *worker) run() {
 		}
 
 		var ok bool
-		if o.counter {
+		var tokens uint64
+		switch {
+		case o.counter:
 			ok = w.checkCounter(slot, o.response, resp)
-		} else {
+		case o.bucket:
+			tokens, ok = w.checkBucket(slot, o.response, resp)
+		default:
 			ok = bytes.Equal(resp, o.response)
 		}
 		switch {
@@ -181,6 +190,7 @@ func (w *worker) run() {
 				w.hist.RecordValue(w.hist.HighestTrackableValue())
 			}
 			w.measuredOps++
+			w.measuredTokens += tokens
 			if o.write {
 				w.measuredWrite++
 			} else {
@@ -197,7 +207,7 @@ func (w *worker) run() {
 // connection, so the exact value is unknown, but this connection's reads are
 // sequential, so each value it sees has to be greater than the previous one.
 func (w *worker) checkCounter(slot int, prefix, resp []byte) bool {
-	v, ok := parseCounter(resp, prefix)
+	v, ok := parseNumber(resp, prefix)
 	if !ok || v <= w.counterLast[slot] {
 		return false
 	}

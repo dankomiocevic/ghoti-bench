@@ -31,6 +31,12 @@ type fakeGhoti struct {
 	values      map[string]int64
 	doubleEvery int64
 	staleEvery  int64
+
+	// With buckets every slot is a token bucket that works like Ghoti's,
+	// unless grant is "always" or "never".
+	buckets *TokenBucket
+	grant   string
+	windows map[string]int64
 }
 
 func startFake(t *testing.T) *fakeGhoti {
@@ -39,7 +45,7 @@ func startFake(t *testing.T) *fakeGhoti {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeGhoti{ln: ln, slots: map[string]string{}, values: map[string]int64{}}
+	f := &fakeGhoti{ln: ln, slots: map[string]string{}, values: map[string]int64{}, windows: map[string]int64{}}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -73,6 +79,10 @@ func (f *fakeGhoti) serve(c net.Conn) {
 			continue
 		}
 		switch {
+		case f.buckets != nil && line[0] == 'r':
+			fmt.Fprintf(c, "v%s%d\n", slot, f.takeToken(slot))
+		case f.buckets != nil:
+			fmt.Fprintf(c, "e%s005\n", slot)
 		case f.counters && line[0] == 'w':
 			v, err := strconv.ParseInt(line[4:], 10, 64)
 			if err != nil || v < 0 {
@@ -118,6 +128,32 @@ func (f *fakeGhoti) serve(c net.Conn) {
 			fmt.Fprint(c, "exxx001\n")
 		}
 	}
+}
+
+// takeToken is Ghoti's token bucket read: refill RefreshRate tokens for every
+// second that started since the last read, up to Size, then take up to
+// TokensPerReq.
+func (f *fakeGhoti) takeToken(slot string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch f.grant {
+	case "always":
+		return 1
+	case "never":
+		return 0
+	}
+	b := f.buckets
+	now := time.Now().Unix()
+	last, seen := f.windows[slot]
+	if !seen {
+		f.values[slot] = int64(b.RefreshRate)
+	} else if now > last {
+		f.values[slot] = min(int64(b.Size), f.values[slot]+(now-last)*int64(b.RefreshRate))
+	}
+	f.windows[slot] = now
+	take := min(f.values[slot], int64(b.TokensPerReq))
+	f.values[slot] -= take
+	return take
 }
 
 func testConfig(addr string) Config {
@@ -443,17 +479,104 @@ func TestPreloadRejectsSimpleMemoryForCounters(t *testing.T) {
 	}
 }
 
-func TestParseCounter(t *testing.T) {
+func TestParseNumber(t *testing.T) {
 	prefix := []byte("v100")
 	good := map[string]int64{"v1000\n": 0, "v10042\n": 42, "v1009223372036854775807\n": 9223372036854775807}
 	for in, want := range good {
-		if got, ok := parseCounter([]byte(in), prefix); !ok || got != want {
+		if got, ok := parseNumber([]byte(in), prefix); !ok || got != want {
 			t.Errorf("%q: got %d %v", in, got, ok)
 		}
 	}
 	for _, in := range []string{"v100\n", "v1001", "v1011\n", "v100-1\n", "v1001a\n", "v1009223372036854775808\n", "e100004\n"} {
-		if _, ok := parseCounter([]byte(in), prefix); ok {
+		if _, ok := parseNumber([]byte(in), prefix); ok {
 			t.Errorf("%q: expected rejection", in)
 		}
+	}
+}
+
+func bucketConfig(f *fakeGhoti, grant string) Config {
+	f.buckets = &TokenBucket{Size: 200, RefreshRate: 100, TokensPerReq: 1, Period: "second"}
+	f.grant = grant
+	cfg := testConfig(f.ln.Addr().String())
+	cfg.Workload = WorkloadTokenBucket
+	cfg.Slots = SlotRange{200, 201}
+	cfg.PayloadSize = 0
+	cfg.Bucket = *f.buckets
+	cfg.Warmup = 0
+	return cfg
+}
+
+func TestRunTokenBucket(t *testing.T) {
+	f := startFake(t)
+	cfg := bucketConfig(f, "")
+	// Long enough for the lower bound: floor(3s)-2 refills.
+	cfg.Duration = 3 * time.Second
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests == 0 || res.Errors.Total() != 0 {
+		t.Fatalf("requests %d errors %+v", res.Requests, res.Errors)
+	}
+	c := res.BucketCheck
+	if c == nil || c.Failed() || len(c.LowerBoundSkipped) > 0 || c.MinTokens == 0 {
+		t.Fatalf("bucket check %+v", c)
+	}
+	if res.Tokens == 0 || res.Tokens >= res.Requests {
+		t.Fatalf("tokens %d of %d requests, the buckets were not drained", res.Tokens, res.Requests)
+	}
+}
+
+func TestRunTokenBucketDetectsOverGranting(t *testing.T) {
+	f := startFake(t)
+	res, err := Run(context.Background(), bucketConfig(f, "always"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := res.BucketCheck; c == nil || len(c.Mismatches) != 2 || !strings.Contains(c.Mismatches[0], "at most") {
+		t.Fatalf("bucket check %+v", c)
+	}
+}
+
+func TestRunTokenBucketDetectsUnderGranting(t *testing.T) {
+	f := startFake(t)
+	cfg := bucketConfig(f, "never")
+	cfg.Duration = 3 * time.Second
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := res.BucketCheck; c == nil || len(c.Mismatches) != 2 || !strings.Contains(c.Mismatches[0], "at least") {
+		t.Fatalf("bucket check %+v", c)
+	}
+}
+
+func TestRunTokenBucketRejectsWrongSlotKind(t *testing.T) {
+	f := startFake(t)
+	cfg := bucketConfig(f, "")
+	f.buckets = nil // a simple memory server: empty slots read back as "v200"
+	_, err := Run(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "token_bucket") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestCheckBucketsBounds(t *testing.T) {
+	cfg := &Config{Slots: SlotRange{300, 303}, Bucket: TokenBucket{Size: 20, RefreshRate: 10, TokensPerReq: 1, Period: "second"}}
+	w := &worker{
+		bucketReqs:   []uint64{1000, 1000, 100, 1000},
+		bucketTokens: []uint64{100, 121, 50, 79},
+	}
+	// 10 periods: at most 20+10*10 tokens, at least 10*(10-2) when the slot
+	// got 2*10*10 requests or more.
+	c := checkBuckets(cfg, []*worker{w}, 10*time.Second)
+	if c.MaxTokens != 120 || c.MinTokens != 80 || c.Tokens != 350 || c.Requests != 3100 {
+		t.Fatalf("check %+v", c)
+	}
+	if len(c.Mismatches) != 2 || !strings.HasPrefix(c.Mismatches[0], "slot 301") || !strings.HasPrefix(c.Mismatches[1], "slot 303") {
+		t.Fatalf("mismatches %q", c.Mismatches)
+	}
+	if len(c.LowerBoundSkipped) != 1 || !strings.HasPrefix(c.LowerBoundSkipped[0], "slot 302") {
+		t.Fatalf("skipped %q", c.LowerBoundSkipped)
 	}
 }

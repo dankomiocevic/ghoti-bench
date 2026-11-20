@@ -16,12 +16,18 @@ const (
 	WorkloadSimpleMixed = "simple-mixed"
 	// WorkloadCounter increments atomic counter slots by reading them.
 	WorkloadCounter = "counter-increment"
+	// WorkloadTokenBucket takes tokens from token bucket slots by reading
+	// them.
+	WorkloadTokenBucket = "token-bucket"
 )
 
 // SlotKind returns the Ghoti slot kind a workload needs.
 func SlotKind(workload string) string {
-	if workload == WorkloadCounter {
+	switch workload {
+	case WorkloadCounter:
 		return "atomic"
+	case WorkloadTokenBucket:
+		return "token_bucket"
 	}
 	return "simple_memory"
 }
@@ -89,12 +95,13 @@ func SlotValue(slot, size int) []byte {
 // are built once before the run so the hot loop never allocates.
 type op struct {
 	request []byte
-	// response is the exact response including the trailing '\n'. For a
-	// counter read it is only the prefix ("v000"), the value is checked by
-	// the worker because it changes on every read.
+	// response is the exact response including the trailing '\n'. For
+	// counter and token bucket reads it is only the prefix ("v000"), the
+	// value is checked by the worker because it changes from read to read.
 	response []byte
 	write    bool
 	counter  bool
+	bucket   bool
 }
 
 // ops holds the prebuilt requests for every slot of the workload.
@@ -107,7 +114,8 @@ type ops struct {
 //
 // For counters the reads are the increments and the writes are only used by
 // the preload, which sets every counter to 0 so the final value of each slot
-// is known after the run.
+// is known after the run. Token buckets cannot be written, they only have
+// reads.
 //
 // Every write to a slot stores the same value the slot was preloaded with,
 // so each response is known exactly: reads can be validated byte by byte even
@@ -130,6 +138,16 @@ func buildOps(workload string, slots SlotRange, payloadSize int, terminator stri
 		}
 		return o
 	}
+	if workload == WorkloadTokenBucket {
+		for s := slots.First; s <= slots.Last; s++ {
+			o.reads = append(o.reads, op{
+				request:  fmt.Appendf(nil, "r%03d%s", s, terminator),
+				response: fmt.Appendf(nil, "v%03d", s),
+				bucket:   true,
+			})
+		}
+		return o
+	}
 	for s := slots.First; s <= slots.Last; s++ {
 		value := SlotValue(s, payloadSize)
 		response := fmt.Appendf(nil, "v%03d%s\n", s, value)
@@ -146,10 +164,10 @@ func buildOps(workload string, slots SlotRange, payloadSize int, terminator stri
 	return o
 }
 
-// parseCounter returns the value of a counter response such as "v000123\n",
-// or false if it is not the given slot followed by a decimal integer that
-// fits in an int64.
-func parseCounter(resp, prefix []byte) (int64, bool) {
+// parseNumber returns the value of a counter or token bucket response such
+// as "v000123\n", or false if it is not the given slot followed by a decimal
+// integer that fits in an int64.
+func parseNumber(resp, prefix []byte) (int64, bool) {
 	if len(resp) < len(prefix)+2 || !bytes.HasPrefix(resp, prefix) || resp[len(resp)-1] != '\n' {
 		return 0, false
 	}

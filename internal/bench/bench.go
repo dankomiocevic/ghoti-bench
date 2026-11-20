@@ -116,6 +116,20 @@ func printSummary(w io.Writer, r *report.Run) {
 	if c := r.Result.CounterCheck; c != nil && !c.Failed() {
 		fmt.Fprintf(w, "  counters match the %d validated increments\n", c.Increments)
 	}
+	if c := r.Result.BucketCheck; c != nil {
+		granted := 0.0
+		if r.Result.Requests > 0 {
+			granted = float64(r.Result.Tokens) / float64(r.Result.Requests) * 100
+		}
+		fmt.Fprintf(w, "  tokens %d (%.2f%% of the requests granted)", r.Result.Tokens, granted)
+		if !c.Failed() {
+			fmt.Fprintf(w, ", every bucket within %d-%d tokens over %.1fs", c.MinTokens, c.MaxTokens, c.Seconds)
+		}
+		fmt.Fprintln(w)
+		if n := len(c.LowerBoundSkipped); n > 0 {
+			fmt.Fprintf(w, "  %d buckets got too few requests to check the lower bound\n", n)
+		}
+	}
 	if r.Result.Valid {
 		fmt.Fprintln(w, "  valid")
 	} else {

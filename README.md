@@ -22,6 +22,7 @@ ghoti-bench run --target 10.0.1.15:9090 --metrics-addr 10.0.1.15:9100 \
   --ghoti-version 0.2.0 --ghoti-commit 90b5271
 ghoti-bench scenarios                              # lists the scenarios
 ghoti-bench fetch --ghoti-ref v0.2.0 --os linux --arch arm64 --output ghoti
+ghoti-bench server-config --addr 0.0.0.0:9090      # config.yaml for every scenario
 ```
 
 ghoti-bench gets a server (release, commit or binary), starts a fresh one for
@@ -47,9 +48,10 @@ Defaults run the full matrix: `--connections 1,100,1000`, `--repetitions 3`,
 the host spreads over every connection count.
 
 With `--target` the server is not started or restarted by ghoti-bench, so
-it must already have the scenario slots configured with the kind the scenario
-needs: `simple_memory` for the memory scenarios and `atomic` for the counter
-scenarios. Ghoti
+it must already have the scenario slots configured the way the scenario
+needs them. `ghoti-bench server-config` prints a `config.yaml` with the slots
+of every scenario; the token bucket checks depend on the bucket size and
+rates, so it is better to use it than to write the slots by hand. Ghoti
 cannot be asked for its version over the network, so pass `--ghoti-version`
 and `--ghoti-commit` to record which Ghoti was measured.
 
@@ -72,14 +74,16 @@ scripts/ec2-bench.sh --repetitions 1 --warmup 5s --duration 30s
 GHOTI_REF=90b5271 SERVER_TYPE=t3.micro GENERATOR_TYPE=c7i.xlarge scripts/ec2-bench.sh
 SCENARIOS="memory-read memory-mixed" scripts/ec2-bench.sh
 scripts/ec2-counter-bench.sh                             # counter-hot and counter-spread, about 2 hours
+scripts/ec2-token-bucket-bench.sh                        # token-bucket-hot and token-bucket-spread, about 2 hours
 ```
 
 `SCENARIOS` runs several scenarios one after the other on the same instances,
 which is cheaper than starting new ones for each and keeps the hardware the
 same for all of them. Each scenario is written to its own directory,
 `results/ec2-<timestamp>/<scenario>/`, and the first one that fails stops the
-rest. `scripts/ec2-counter-bench.sh` is `ec2-bench.sh` with `SCENARIOS` set to
-the counter scenarios, and takes the same settings and arguments.
+rest. `scripts/ec2-counter-bench.sh` and `scripts/ec2-token-bucket-bench.sh`
+are `ec2-bench.sh` with `SCENARIOS` set to the counter and token bucket
+scenarios, and take the same settings and arguments.
 
 The script:
 
@@ -90,11 +94,11 @@ The script:
    instances on Amazon Linux 2023 in one availability zone. T instances use
    `unlimited` CPU credits (`T_CREDITS`) so the server is not throttled
    halfway through.
-3. Starts Ghoti as a systemd unit with simple memory slots `000-099`, atomic
-   counter slots `100-199` and metrics enabled, so one server can run every
-   scenario,
-   then runs `ghoti-bench run --target` on the generator, detached so a
-   dropped SSH connection does not stop it, and streams its log.
+3. Starts Ghoti as a systemd unit with metrics enabled and the configuration
+   from `ghoti-bench server-config`, which has the slots of every scenario so
+   one server can run them all. Then it runs `ghoti-bench run --target` on
+   the generator, detached so a dropped SSH connection does not stop it, and
+   streams its log.
 4. Downloads `summary.csv`, the run JSONs, the benchmark log, the Ghoti
    journal and config, the final metrics and both hosts' CPU and memory
    details into `results/ec2-<timestamp>/`.
@@ -158,6 +162,51 @@ Counters only use reads. A write sets the counter to an absolute value, which
 would make the values a connection reads jump backwards and the final check
 impossible.
 
+### token-bucket-hot
+
+Every connection takes tokens from the same token bucket, slot `200`, with
+`bucket_size` 2000, `refresh_rate` 1000, `tokens_per_req` 1 and `period`
+`second`.
+
+1. Each connection repeatedly sends `r200\n`. The response is the number of
+   tokens granted, `v2001\n` or `v2000\n` when the request is denied. Any
+   other response is incorrect.
+2. A token bucket cannot be written, so it cannot be set to a known value
+   before the run the way the counters are. The slot is read once before the
+   run instead, so a slot of the wrong kind stops the benchmark before it
+   starts.
+3. After the run, if there were no errors, the tokens granted over the whole
+   run, warm-up included, are checked against what the bucket allows. Ghoti
+   refills a bucket at the start of every period of the server clock, so in
+   a run of `T` seconds:
+   - The bucket can never grant more than it held at the start, at most
+     `bucket_size`, plus `refresh_rate` for each of the at most `ceil(T)`
+     refills.
+   - While the load keeps the bucket empty it has to grant every refill. The
+     first and last can be missed at the edges of the run, so it has to grant
+     at least `refresh_rate` for `floor(T) - 2` refills. This bound is only
+     checked for a slot that got at least twice as many requests as the
+     refills, otherwise the bucket may not have been kept empty.
+
+   The bounds count refills in the length of the run, which does not depend
+   on the server and generator clocks being in sync. A slot outside them
+   makes the run invalid.
+
+It measures the rate limiter when every connection contends for the same
+slot. Almost every request is denied, which is the path a rate limiter takes
+most under load.
+
+### token-bucket-spread
+
+The same as `token-bucket-hot` over slots `300-399`, slot chosen uniformly,
+with `bucket_size` 20 and `refresh_rate` 10 for every slot.
+
+The rates are low enough that a single connection keeps every bucket empty:
+on EC2 one connection makes about 3,000 requests per second, 30 per slot,
+while the slots refill 10 tokens per second. Each bucket holds two periods of
+tokens, so a second in which a slot gets fewer requests does not throw a
+refill away.
+
 ## Method
 
 - **Closed loop.** One request in flight per connection, as the Ghoti
@@ -185,7 +234,8 @@ impossible.
 - **Validity.** A run is `valid` only if every connection was established,
   there were no errors at all (warm-up included), it was not interrupted, the
   server reported every connection for the whole measurement, the counters
-  matched the validated increments (counter scenarios), and the generator CPU stayed under
+  matched the validated increments (counter scenarios), every token bucket
+  granted the tokens it allows (token bucket scenarios), and the generator CPU stayed under
   `--max-generator-cpu` (80%). Past that the generator may be what is being
   measured. The reasons are listed in `run.json`. The table printed at the
   end aggregates only valid runs (`N/A` when there are none) and lists the
@@ -212,7 +262,8 @@ run_id,timestamp,scenario,server_instance,generators,connections,duration_s,tota
 ```
 
 Server columns are empty when they could not be collected. `run.json` adds the
-error breakdown, reads and writes, the counter check, p90, mean and stddev, generator CPU and
+error breakdown, reads and writes, the tokens granted, the counter and token
+bucket checks, p90, mean and stddev, generator CPU and
 network peak (application bytes), the Ghoti version and commit, the per-second
 load and server timelines, and the reasons for an invalid run. Nothing is
 written per request.

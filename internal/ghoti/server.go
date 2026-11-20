@@ -17,15 +17,28 @@ import (
 type ServerConfig struct {
 	Addr        string
 	MetricsAddr string
-	// Slots lists the slots to configure, all of kind SlotKind.
-	Slots []int
-	// SlotKind is the Ghoti slot kind, simple_memory when empty.
-	SlotKind string
+	// Slots lists the slots to configure.
+	Slots []Slot
 	// LogLevel should stay at warn or error so logging does not distort
 	// the measurement.
 	LogLevel string
 	// GOMAXPROCS limits the server cores, 0 leaves the Go default.
 	GOMAXPROCS int
+}
+
+// Slot is one slot of the configuration.
+type Slot struct {
+	Number int
+	// Kind is the Ghoti slot kind, simple_memory when empty.
+	Kind string
+	// Options are the settings of the kind, written in order.
+	Options []Option
+}
+
+// Option is one setting of a slot, such as bucket_size: 100.
+type Option struct {
+	Key   string
+	Value string
 }
 
 // YAML renders the configuration file.
@@ -40,12 +53,15 @@ func (c ServerConfig) YAML() string {
 	if c.MetricsAddr != "" {
 		fmt.Fprintf(&b, "metrics:\n  enabled: true\n  addr: %q\n", c.MetricsAddr)
 	}
-	kind := c.SlotKind
-	if kind == "" {
-		kind = "simple_memory"
-	}
 	for _, s := range c.Slots {
-		fmt.Fprintf(&b, "slot_%03d:\n  kind: %s\n", s, kind)
+		kind := s.Kind
+		if kind == "" {
+			kind = "simple_memory"
+		}
+		fmt.Fprintf(&b, "slot_%03d:\n  kind: %s\n", s.Number, kind)
+		for _, o := range s.Options {
+			fmt.Fprintf(&b, "  %s: %s\n", o.Key, o.Value)
+		}
 	}
 	return b.String()
 }
