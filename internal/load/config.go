@@ -15,16 +15,20 @@ type Config struct {
 	// Connections is the number of persistent connections, each with one
 	// request in flight at a time.
 	Connections int
-	// Workload is WorkloadSimpleRead, WorkloadSimpleMixed or WorkloadCounter.
+	// Workload is WorkloadSimpleRead, WorkloadSimpleMixed, WorkloadCounter or
+	// WorkloadTokenBucket.
 	Workload string
 	// ReadPercent is the share of reads for WorkloadSimpleMixed (0-100).
 	ReadPercent int
 	// Slots is the range of slots the workload uses, of the kind given by
 	// SlotKind.
 	Slots SlotRange
-	// PayloadSize is the value size in bytes (1-36). It is not used by
-	// WorkloadCounter, whose values are the counter.
+	// PayloadSize is the value size in bytes (1-36). It is only used by the
+	// simple memory workloads.
 	PayloadSize int
+	// Bucket is the token bucket configuration of the slots, only used by
+	// WorkloadTokenBucket.
+	Bucket TokenBucket
 
 	Warmup   time.Duration
 	Duration time.Duration
@@ -81,7 +85,7 @@ func (c *Config) Defaults() {
 	if c.SampleInterval == 0 {
 		c.SampleInterval = time.Second
 	}
-	if c.Workload == WorkloadSimpleRead || c.Workload == WorkloadCounter {
+	if c.Workload != WorkloadSimpleMixed {
 		c.ReadPercent = 100
 	}
 }
@@ -96,11 +100,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("protocol %q not supported, use standard or telnet", c.Protocol)
 	case c.Connections < 1:
 		return errors.New("connections must be at least 1")
-	case c.Workload != WorkloadSimpleRead && c.Workload != WorkloadSimpleMixed && c.Workload != WorkloadCounter:
-		return fmt.Errorf("workload %q not supported, use %s, %s or %s", c.Workload, WorkloadSimpleRead, WorkloadSimpleMixed, WorkloadCounter)
+	case c.Workload != WorkloadSimpleRead && c.Workload != WorkloadSimpleMixed && c.Workload != WorkloadCounter && c.Workload != WorkloadTokenBucket:
+		return fmt.Errorf("workload %q not supported, use %s, %s, %s or %s",
+			c.Workload, WorkloadSimpleRead, WorkloadSimpleMixed, WorkloadCounter, WorkloadTokenBucket)
 	case c.ReadPercent < 0 || c.ReadPercent > 100:
 		return errors.New("read-percent must be between 0 and 100")
-	case c.Workload != WorkloadCounter && (c.PayloadSize < 1 || c.PayloadSize > MaxValueSize):
+	case (c.Workload == WorkloadSimpleRead || c.Workload == WorkloadSimpleMixed) && (c.PayloadSize < 1 || c.PayloadSize > MaxValueSize):
 		return fmt.Errorf("payload-size must be between 1 and %d bytes", MaxValueSize)
 	case c.Slots.Len() < 1:
 		return errors.New("slots range is empty")
@@ -116,6 +121,9 @@ func (c *Config) Validate() error {
 		return errors.New("dial concurrency must be at least 1")
 	case c.SampleInterval < MinSampleInterval:
 		return fmt.Errorf("sample interval must be at least %s", MinSampleInterval)
+	}
+	if c.Workload == WorkloadTokenBucket {
+		return c.Bucket.validate()
 	}
 	return nil
 }
@@ -151,9 +159,10 @@ func (c *Config) RequestPattern() string {
 }
 
 // ResponseWireBytes is the size of a value response including its prefix
-// and terminator. It is 0 for counters, whose responses grow with the value.
+// and terminator. It is 0 for counters and token buckets, whose responses
+// change size with the value.
 func (c *Config) ResponseWireBytes() int {
-	if c.Workload == WorkloadCounter {
+	if c.Workload == WorkloadCounter || c.Workload == WorkloadTokenBucket {
 		return 0
 	}
 	return 1 + 3 + c.PayloadSize + 1

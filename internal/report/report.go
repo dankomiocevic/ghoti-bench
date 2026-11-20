@@ -105,9 +105,12 @@ type GeneratorInfo struct {
 }
 
 type ResultInfo struct {
-	Requests               uint64           `json:"requests"`
-	Reads                  uint64           `json:"reads"`
-	Writes                 uint64           `json:"writes"`
+	Requests uint64 `json:"requests"`
+	Reads    uint64 `json:"reads"`
+	Writes   uint64 `json:"writes"`
+	// Tokens is the number of tokens granted to the measured token bucket
+	// reads, out of Requests.
+	Tokens                 uint64           `json:"tokens,omitempty"`
 	ThroughputRps          float64          `json:"throughputRps"`
 	Errors                 uint64           `json:"errors"`
 	ErrorRate              float64          `json:"errorRate"`
@@ -120,9 +123,11 @@ type ResultInfo struct {
 	AsyncEvents            uint64           `json:"asyncEvents"`
 	Interrupted            bool             `json:"interrupted"`
 	// CounterCheck is only set for counter workloads without errors.
-	CounterCheck   *load.CounterCheck `json:"counterCheck,omitempty"`
-	Valid          bool               `json:"valid"`
-	InvalidReasons []string           `json:"invalidReasons,omitempty"`
+	CounterCheck *load.CounterCheck `json:"counterCheck,omitempty"`
+	// BucketCheck is only set for token bucket workloads without errors.
+	BucketCheck    *load.BucketCheck `json:"bucketCheck,omitempty"`
+	Valid          bool              `json:"valid"`
+	InvalidReasons []string          `json:"invalidReasons,omitempty"`
 }
 
 type Latency struct {
@@ -190,6 +195,7 @@ func Build(meta Meta, cfg load.Config, res *load.Result, server serverstats.Summ
 		Requests:               res.Requests,
 		Reads:                  res.Reads,
 		Writes:                 res.Writes,
+		Tokens:                 res.Tokens,
 		ThroughputRps:          round(res.ThroughputRPS, 1),
 		Errors:                 errs,
 		ErrorBreakdown:         res.Errors,
@@ -201,6 +207,7 @@ func Build(meta Meta, cfg load.Config, res *load.Result, server serverstats.Summ
 		AsyncEvents:            res.AsyncEvents,
 		Interrupted:            res.Interrupted,
 		CounterCheck:           res.CounterCheck,
+		BucketCheck:            res.BucketCheck,
 	}
 	if total := res.Requests + errs; total > 0 {
 		r.Result.ErrorRate = float64(errs) / float64(total)
@@ -246,6 +253,11 @@ func invalidReasons(res *load.Result, server serverstats.Summary, maxGenCPU floa
 		}
 		for _, m := range c.Mismatches {
 			reasons = append(reasons, "counter mismatch, "+m)
+		}
+	}
+	if c := res.BucketCheck; c != nil {
+		for _, m := range c.Mismatches {
+			reasons = append(reasons, "token bucket out of bounds, "+m)
 		}
 	}
 	if res.GeneratorCPUMaxPct > maxGenCPU {

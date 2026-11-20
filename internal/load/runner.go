@@ -35,7 +35,9 @@ type Result struct {
 	ConnectionsRequested   int
 	ConnectionsEstablished int
 
-	StartedAt    time.Time
+	StartedAt time.Time
+	// FinishedAt is when the last worker received its last response.
+	FinishedAt   time.Time
 	MeasureStart time.Time
 	MeasureEnd   time.Time
 	// MeasuredSeconds is the length of the measurement window, shorter than
@@ -48,6 +50,9 @@ type Result struct {
 	Reads         uint64
 	Writes        uint64
 	ThroughputRPS float64
+	// Tokens is the number of tokens the measured token bucket reads were
+	// granted.
+	Tokens uint64
 
 	// Latency holds every measured round trip in nanoseconds.
 	Latency    *hdrhistogram.Histogram
@@ -65,6 +70,9 @@ type Result struct {
 	// CounterCheck is the end of run check of a counter workload, nil when
 	// it did not run.
 	CounterCheck *CounterCheck
+	// BucketCheck is the end of run check of a token bucket workload, nil
+	// when it did not run.
+	BucketCheck *BucketCheck
 
 	Timeline           []Sample
 	GeneratorCPUAvgPct float64
@@ -99,7 +107,12 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 
 	plan := buildOps(cfg.Workload, cfg.Slots, cfg.PayloadSize, cfg.terminator())
-	if !cfg.SkipPreload {
+	switch {
+	case cfg.Workload == WorkloadTokenBucket:
+		if err := probeBuckets(&cfg, &plan); err != nil {
+			return nil, fmt.Errorf("checking slots: %w", err)
+		}
+	case !cfg.SkipPreload:
 		if err := preload(&cfg, &plan); err != nil {
 			return nil, fmt.Errorf("preloading slots: %w", err)
 		}
@@ -141,6 +154,10 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 				}
 			}
 		}
+		if cfg.Workload == WorkloadTokenBucket {
+			w.bucketReqs = make([]uint64, cfg.Slots.Len())
+			w.bucketTokens = make([]uint64, cfg.Slots.Len())
+		}
 		w.attach(conn)
 		workers[i] = w
 	}
@@ -174,6 +191,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		res.Interrupted = true
 		<-done
 	}
+	res.FinishedAt = time.Now()
 	<-samplerDone
 
 	merge(res, workers, &cfg, &tl)
@@ -181,6 +199,11 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	// still have incremented its slot.
 	if cfg.Workload == WorkloadCounter && !cfg.SkipPreload && res.Errors.Total()+res.WarmupErrors.Total()+res.LateErrors.Total() == 0 {
 		res.CounterCheck = checkCounters(&cfg, workers)
+	}
+	// The same goes for token buckets: a request that timed out may still
+	// have taken a token.
+	if cfg.Workload == WorkloadTokenBucket && res.Errors.Total()+res.WarmupErrors.Total()+res.LateErrors.Total() == 0 {
+		res.BucketCheck = checkBuckets(&cfg, workers, res.FinishedAt.Sub(res.StartedAt))
 	}
 	return res, nil
 }
@@ -220,7 +243,7 @@ func checkCounters(cfg *Config, workers []*worker) *CounterCheck {
 			check.Error = err.Error()
 			return check
 		}
-		got, ok := parseCounter(line, fmt.Appendf(nil, "v%03d", slot))
+		got, ok := parseNumber(line, fmt.Appendf(nil, "v%03d", slot))
 		if !ok {
 			check.Error = fmt.Sprintf("slot %03d answered %q", slot, bytes.TrimSpace(line))
 			return check
@@ -253,6 +276,7 @@ func merge(res *Result, workers []*worker, cfg *Config, tl *timeline) {
 		res.Requests += w.measuredOps
 		res.Reads += w.measuredRead
 		res.Writes += w.measuredWrite
+		res.Tokens += w.measuredTokens
 		res.Errors.add(w.measureErrors)
 		res.WarmupErrors.add(w.warmupErrors)
 		res.LateErrors.add(w.lateErrors)

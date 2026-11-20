@@ -32,6 +32,7 @@ const usage = `Usage:
   ghoti-bench run (--ghoti-ref REF | --ghoti-binary PATH | --target HOST:PORT) [flags]
   ghoti-bench scenarios
   ghoti-bench fetch --ghoti-ref REF [--os linux --arch arm64] [--output PATH]
+  ghoti-bench server-config [--addr HOST:PORT] [--metrics-addr HOST:PORT]
 
 Examples:
   ghoti-bench run --ghoti-ref v0.2.0
@@ -65,7 +66,12 @@ func main() {
 	case "scenarios":
 		for _, n := range scenario.Names() {
 			s, _ := scenario.Get(n)
-			fmt.Printf("%-14s %s\n", s.Name, s.Description)
+			fmt.Printf("%-19s %s\n", s.Name, s.Description)
+		}
+	case "server-config":
+		if err := serverConfig(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ghoti-bench:", err)
+			os.Exit(1)
 		}
 	default:
 		printUsage()
@@ -109,6 +115,24 @@ func fetch(args []string) error {
 		path = *output
 	}
 	fmt.Printf("path=%s\nversion=%s\ncommit=%s\nsource=%s\n", path, bin.Version, bin.Commit, bin.Source)
+	return nil
+}
+
+// serverConfig prints a Ghoti config.yaml with the slots of every scenario,
+// for a server that ghoti-bench does not start, such as the one on EC2.
+func serverConfig(args []string) error {
+	fs := flag.NewFlagSet("ghoti-bench server-config", flag.ContinueOnError)
+	addr := fs.String("addr", "0.0.0.0:9090", "address Ghoti listens on")
+	metricsAddr := fs.String("metrics-addr", "0.0.0.0:9100", "address of the metrics endpoint, empty to disable it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	slots, err := scenario.AllServerSlots()
+	if err != nil {
+		return err
+	}
+	cfg := ghoti.ServerConfig{Addr: *addr, MetricsAddr: *metricsAddr, Slots: slots, LogLevel: "warn"}
+	fmt.Print(cfg.YAML())
 	return nil
 }
 
@@ -275,6 +299,7 @@ func runOne(ctx context.Context, o *options, sc scenario.Scenario, bin *ghoti.Bi
 			ReadPercent:    sc.ReadPercent,
 			Slots:          sc.Slots,
 			PayloadSize:    sc.PayloadSize,
+			Bucket:         sc.Bucket,
 			Warmup:         o.warmup,
 			Duration:       o.duration,
 			RequestTimeout: o.requestTimeout,
@@ -311,8 +336,7 @@ func runOne(ctx context.Context, o *options, sc scenario.Scenario, bin *ghoti.Bi
 	spec.Meta = meta
 
 	cfg := ghoti.ServerConfig{
-		Slots:      sc.SlotList(),
-		SlotKind:   sc.SlotKind(),
+		Slots:      sc.ServerSlots(),
 		LogLevel:   "warn",
 		GOMAXPROCS: o.serverGOMAXPROCS,
 	}
