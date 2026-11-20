@@ -1,18 +1,44 @@
 # Ghoti Benchmarks
 
-These are the results of benchmarking Ghoti on AWS EC2 with [ghoti-bench](README.md). They compare Ghoti v0.2.0 with v0.3.0, and the different slot types on v0.3.0. Every number on this page can be reproduced with the commands in [How to reproduce](#how-to-reproduce).
+These are the results of benchmarking Ghoti v0.3.0 on AWS EC2 with [ghoti-bench](README.md). Ghoti ran on a t4g.micro, a small Graviton instance with 2 cores and 1 GiB of memory, and answered most requests in well under a millisecond. Every number on this page can be reproduced with the commands in [How to reproduce](#how-to-reproduce).
 
 ## Summary
 
-- **v0.3.0 is faster than v0.2.0.** With 100 connections on a t4g.micro it serves 134,343 requests per second against 78,185, 71.8% more. With 1000 connections it serves 112,647 against 63,186, 78.3% more.
-- **Latency is lower too.** With 100 connections, 99% of the requests take less than 3.54 ms on v0.3.0 and 5.30 ms on v0.2.0.
-- **Counters and token buckets cost the same as memory reads.** On v0.3.0 every slot type is within 5% of plain memory reads, even when every connection uses the same slot.
-- **A bigger instance does not help.** v0.2.0 on a t4g.small, with twice the memory of a t4g.micro and the same 2 cores, serves 80,291 requests per second with 100 connections, 2.7% more. The server is limited by CPU.
-- **Every result is valid.** All 39 runs finished with 0 errors over 524,263,392 requests, and every counter and token bucket gave the right answers.
+- **Sub-millisecond answers.** With one connection, 99.9% of the requests of every slot type got their answer in less than 0.75 ms, measured on the client and including the network between the two instances. Half of them took less than 0.29 ms.
+- **Still sub-millisecond under load.** With 100 connections Ghoti served 134,343 requests per second and half of the requests got their answer in less than 0.60 ms, for every slot type (the slowest median was 0.628 ms).
+- **Microseconds inside the server.** Ghoti's own metrics show an average of 7.6 µs per request over 247,423,099 memory reads, with 99.8% of them taking less than 50 µs and 99.97% less than a millisecond.
+- **Every slot type is as fast.** Atomic counters and token buckets answer as fast as plain memory reads, even when every connection uses the same slot.
+- **Every answer was right.** All 21 runs finished with 0 errors over 255,244,437 requests, and every counter and token bucket gave exactly the answers they had to.
+
+## How the setup works
+
+Every session uses two EC2 instances that `scripts/ec2-bench.sh` creates for it and deletes when it is done. Ghoti runs alone on the small one. ghoti-bench, the load generator, runs on a much bigger one, so that the generator never runs out of CPU and the numbers are about Ghoti.
+
+```mermaid
+flowchart LR
+    you["Your machine<br/>scripts/ec2-bench.sh"]
+    subgraph aws["AWS us-west-2, one subnet in one availability zone"]
+        gen["Generator<br/>c7g.xlarge, 4 cores<br/>ghoti-bench"]
+        srv["Server<br/>t4g.micro, 2 cores, 1 GiB<br/>Ghoti v0.3.0"]
+    end
+    you -- "SSH: start the run, stream the log,<br/>download the results" --> gen
+    you -- "SSH: install and start Ghoti" --> srv
+    gen -- "1, 100 or 1000 TCP connections<br/>port 9090" --> srv
+    gen -. "metrics every second<br/>port 9100" .-> srv
+```
+
+A session goes like this:
+
+1. **Build.** The script builds ghoti-bench for the generator and downloads the released Ghoti binary for the server, checked against the release checksums.
+2. **Launch.** It creates both instances in the same subnet, with a temporary key pair and a firewall that only lets your machine in over SSH and only lets the generator reach Ghoti. Keeping both in one zone means the network between them is as short as EC2 offers.
+3. **Start Ghoti.** Ghoti starts on the server with the slots every scenario needs and its Prometheus metrics enabled.
+4. **Run the matrix.** On the generator, ghoti-bench runs each scenario with 1, 100 and 1000 connections. Every connection is opened first and stays open. Each one sends a request, waits for the whole answer, checks it and only then sends the next one, so a connection never has more than one request in flight. A warm-up runs before every measurement and is not counted.
+5. **Measure both sides.** The generator times every round trip, from sending a request until its whole answer is back, which includes the network. Every second it also reads Ghoti's metrics for the server CPU, memory and connected clients. Ghoti times every request it handles too, and those times are in the metrics the script downloads at the end.
+6. **Collect and clean up.** The script downloads the results, Ghoti's log and the final metrics to your machine, then deletes both instances, the key pair and the firewall, also when the run fails.
 
 ## What was measured
 
-Ghoti runs alone on a small server instance, a t4g.micro with 2 cores. A much bigger instance in the same zone opens a number of connections to it (1, 100 or 1000) and sends requests as fast as the server answers them. Each connection waits for the answer to its request before it sends the next one, so the number of requests per second is what the server can sustain with that many clients.
+Each connection waits for the answer to its request before it sends the next one, so the benchmark measures both how many requests per second Ghoti sustains and how long each request takes.
 
 |Scenario |What every request does |Runs |
 |---|---|---|
@@ -22,42 +48,83 @@ Ghoti runs alone on a small server instance, a t4g.micro with 2 cores. A much bi
 |token-bucket-hot |Takes a token from one token bucket that every connection shares, 1,000 tokens per second. |1 run of 30 seconds |
 |token-bucket-spread |Takes a token from one of 100 token buckets, chosen at random, 10 tokens per second each. |1 run of 30 seconds |
 
-The charts show 100 and 1000 connections, where the server is the limit. With a single connection the result depends mostly on the network between the two instances, see [Single connections](#single-connections).
+Latency is given as percentiles: p50 is the time half of the requests stay under, p99 the time 99% of them stay under, and p99.9 the time all but one in a thousand stay under.
 
-## v0.3.0 against v0.2.0
+## Latency with one connection
 
-memory-read, the median of three runs.
+With one connection Ghoti answers each request as soon as it arrives, so this is the fastest a client can get an answer. The times are measured on the client and include the network round trip between the two instances.
 
 ```text
-100 connections
+Round trip, p50, 1 connection. A full bar is 1 ms.
 
-v0.2.0 on t4g.micro  ██████████████████▋                78,185 req/s
-v0.2.0 on t4g.small  ███████████████████▏               80,291 req/s
-v0.3.0 on t4g.micro  ████████████████████████████████  134,343 req/s
+memory-read          █████████▎                        0.290 ms
+counter-hot          █████████                         0.282 ms
+counter-spread       █████████▍                        0.294 ms
+token-bucket-hot     ███████▊                          0.242 ms
+token-bucket-spread  ███████▊                          0.242 ms
 ```
 
 ```text
-1,000 connections
+Round trip, p99.9, 1 connection. A full bar is 1 ms.
 
-v0.2.0 on t4g.micro  ██████████████████                 63,186 req/s
-v0.2.0 on t4g.small  ██████████████████▍                64,896 req/s
-v0.3.0 on t4g.micro  ████████████████████████████████  112,647 req/s
+memory-read          ███████████████████▏              0.597 ms
+counter-hot          ███████████████████████▉          0.747 ms
+counter-spread       █████████████████▋                0.552 ms
+token-bucket-hot     █████████████████████▊            0.681 ms
+token-bucket-spread  ███████████████████████           0.719 ms
 ```
 
-|Version and server |Connections |Requests per second |Change |p50 ms |p99 ms |Server CPU |
+|Scenario |p50 ms |p90 ms |p99 ms |p99.9 ms |
+|---|--:|--:|--:|--:|
+|memory-read |0.290 |0.322 |0.372 |0.597 |
+|counter-hot |0.282 |0.309 |0.368 |0.747 |
+|counter-spread |0.294 |0.321 |0.369 |0.552 |
+|token-bucket-hot |0.242 |0.274 |0.332 |0.681 |
+|token-bucket-spread |0.242 |0.286 |0.368 |0.719 |
+
+## Latency under load
+
+With 100 connections Ghoti serves over a hundred thousand requests per second and the median answer still comes back in about 0.6 ms. The slowest requests take a few milliseconds, because with 100 clients sending at full speed some requests have to wait for others to be answered first.
+
+```text
+Round trip, p50, 100 connections. A full bar is 1 ms.
+
+memory-read          ███████████████████▎              0.600 ms
+counter-hot          ████████████████████▏             0.628 ms
+counter-spread       ███████████████████▎              0.602 ms
+token-bucket-hot     ██████████████████▉               0.588 ms
+token-bucket-spread  ██████████████████▉               0.591 ms
+```
+
+|Scenario |Requests per second |p50 ms |p90 ms |p99 ms |p99.9 ms |Server CPU |
 |---|--:|--:|--:|--:|--:|--:|
-|v0.2.0 on t4g.micro |100 |78,185 |- |1.026 |5.304 |96% |
-|v0.2.0 on t4g.small |100 |80,291 |+2.7% |1.015 |5.095 |95% |
-|v0.3.0 on t4g.micro |100 |134,343 |+71.8% |0.600 |3.541 |82% |
-|v0.2.0 on t4g.micro |1,000 |63,186 |- |14.926 |33.243 |92% |
-|v0.2.0 on t4g.small |1,000 |64,896 |+2.7% |14.533 |32.670 |92% |
-|v0.3.0 on t4g.micro |1,000 |112,647 |+78.3% |8.376 |18.694 |89% |
+|memory-read |134,343 |0.600 |1.101 |3.541 |7.123 |82% |
+|counter-hot |127,594 |0.628 |1.168 |4.053 |8.864 |78% |
+|counter-spread |134,746 |0.602 |1.092 |3.494 |7.881 |83% |
+|token-bucket-hot |139,552 |0.588 |1.075 |3.379 |7.803 |86% |
+|token-bucket-spread |139,188 |0.591 |1.081 |3.238 |7.520 |86% |
 
-The change is against v0.2.0 on a t4g.micro with the same number of connections. Server CPU is the average use of both cores during the run.
+## Time inside Ghoti
 
-## Slot types
+Ghoti measures every request itself, from the moment it has the complete request until the answer is written to the connection. That leaves out the network and the client, so it shows how much of the round trip is Ghoti. The numbers cover every request of each session, warm-ups and every connection count included.
 
-Ghoti v0.3.0 on a t4g.micro. memory-read is the median of three runs, the other slot types one run each.
+|Session |Requests |Average |Under 50 µs |Under 100 µs |Under 250 µs |Under 1 ms |
+|---|--:|--:|--:|--:|--:|--:|
+|Memory reads |247,423,099 |7.6 µs |99.83% |99.93% |99.95% |99.97% |
+|Counters |17,275,413 |11.6 µs |99.64% |99.82% |99.86% |99.91% |
+|Token buckets |17,976,490 |11.2 µs |99.65% |99.84% |99.88% |99.92% |
+
+Almost all of a sub-millisecond round trip is the network, the operating systems and the client. Ghoti itself spends a few microseconds on each request.
+
+## Many connections
+
+With 1000 connections the round trip is no longer under a millisecond: the median is 8.4 ms. Ghoti is not slower per request, it is busy. The server uses 89% of its 2 cores and serves 112,647 requests per second, so 1000 clients that each keep one request waiting share that rate. Each one waits about 1000 / 112,647 = 8.9 ms for its turn, which matches the measured average of 8.9 ms.
+
+Ghoti's own time stays in microseconds through these runs too. They are almost half of the requests of the memory session, and 99.8% of all its requests took less than 50 µs, so nearly all of the 1000 connection requests did as well. What grows is the time each request waits for its turn. With fewer clients waiting at once, as with 100 connections, the median answer comes back in under a millisecond on this same 2 core instance.
+
+## Throughput
+
+Requests per second each slot type sustained. memory-read is the median of three runs, the other slot types one run each, so differences of a few percent between them are within what one run can show.
 
 ```text
 100 connections
@@ -79,24 +146,9 @@ token-bucket-hot     ███████████████████�
 token-bucket-spread  ████████████████████████████████  113,062 req/s
 ```
 
-|Scenario |Connections |Requests per second |Against memory-read |p50 ms |p99 ms |Server CPU |
-|---|--:|--:|--:|--:|--:|--:|
-|memory-read |100 |134,343 |- |0.600 |3.541 |82% |
-|counter-hot |100 |127,594 |-5.0% |0.628 |4.053 |78% |
-|counter-spread |100 |134,746 |+0.3% |0.602 |3.494 |83% |
-|token-bucket-hot |100 |139,552 |+3.9% |0.588 |3.379 |86% |
-|token-bucket-spread |100 |139,188 |+3.6% |0.591 |3.238 |86% |
-|memory-read |1,000 |112,647 |- |8.376 |18.694 |89% |
-|counter-hot |1,000 |110,026 |-2.3% |8.552 |19.300 |88% |
-|counter-spread |1,000 |112,955 |+0.3% |8.385 |17.990 |90% |
-|token-bucket-hot |1,000 |113,173 |+0.5% |8.339 |18.711 |89% |
-|token-bucket-spread |1,000 |113,062 |+0.4% |8.397 |17.842 |90% |
-
-Differences of a few percent between slot types are within what one 30 second run can show, so the slot types should be read as equal.
-
 ## Correctness checks
 
-The value of a counter or a token bucket changes on every request, so the answers cannot be checked one by one the way a memory read is. They are checked after the run instead:
+A fast answer only counts if it is right. Every memory read is compared byte by byte with the value the slot holds. The value of a counter or a token bucket changes on every request, so those are checked after the run:
 
 - **Counters** are read back once the run is over. A counter has to hold exactly the number of increments the benchmark counted, otherwise some were lost or applied twice.
 - **Token buckets** have to hand out every token they refill while the load keeps them empty, and never more than they can hold plus their refills.
@@ -116,89 +168,49 @@ The value of a counter or a token bucket changes on every request, so the answer
 |token-bucket-spread |100 |Passed. 30,000 tokens in the 30 second window. Over the whole 35 second run the 100 buckets handed out 36,900 tokens, with 330 to 380 allowed for each one. |
 |token-bucket-spread |1,000 |Passed. 30,000 tokens in the 30 second window. Over the whole 35 second run the 100 buckets handed out 36,900 tokens, with 330 to 380 allowed for each one. |
 
-## Single connections
-
-With a single connection the server is idle most of the time, waiting for the next request, so the result is mostly the network round trip between the two instances. v0.2.0 ran at 7,964 requests per second (p50 0.121 ms) and v0.3.0 at 3,359 (p50 0.290 ms) on the same instance types, in different sessions. The gap most likely comes from the network path each pair of instances got, not from Ghoti, so the versions are compared with 100 and 1000 connections. The single connection numbers are in [All results](#all-results).
-
 ## How to reproduce
 
 1. Install the AWS CLI v2 with credentials for an account that has a default VPC in the region, plus Go, ssh, scp and curl.
 2. Clone ghoti-bench and run the command of the session you want to repeat from its root.
-3. The script creates both instances, runs the benchmark, downloads everything to `results/ec2-<timestamp>/` and deletes every resource it created, also when it fails. A full memory session takes about an hour, a slot type session a few minutes.
-4. Compare your `summary.csv` with [All results](#all-results).
+3. The script creates both instances, runs the benchmark, downloads everything to `results/ec2-<timestamp>/` and deletes every resource it created, also when it fails. The memory session takes about an hour, the counter and token bucket sessions a few minutes each.
+4. Compare your `summary.csv` with [All results](#all-results). The time inside Ghoti is in `server/metrics-final.txt`, under `ghoti_request_duration_seconds`.
 
 |Session |Command |
 |---|---|
-|v0.2.0 on t4g.micro |`AWS_REGION=us-west-2 GHOTI_REF=v0.2.0 scripts/ec2-bench.sh` |
-|v0.2.0 on t4g.small |`AWS_REGION=us-west-2 GHOTI_REF=v0.2.0 SERVER_TYPE=t4g.small scripts/ec2-bench.sh` |
-|v0.3.0 on t4g.micro |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-bench.sh` |
-|Counters on v0.3.0 t4g.micro |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-counter-bench.sh --repetitions 1 --warmup 5s --duration 30s` |
-|Token buckets on v0.3.0 t4g.micro |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-token-bucket-bench.sh --repetitions 1 --warmup 5s --duration 30s` |
+|Memory reads |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-bench.sh` |
+|Counters |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-counter-bench.sh --repetitions 1 --warmup 5s --duration 30s` |
+|Token buckets |`AWS_REGION=us-west-2 GHOTI_REF=v0.3.0 scripts/ec2-token-bucket-bench.sh --repetitions 1 --warmup 5s --duration 30s` |
 
-Every session ran on a c7g.xlarge generator in us-west-2. The memory sessions ran three repetitions of 5 minutes after a 30 second warm-up, and the slot type sessions one of 30 seconds after a 5 second warm-up. Each session used a build of ghoti-bench from before its scripts were merged, so a run from `main` can differ slightly.
+The memory session runs three repetitions of 5 minutes after a 30 second warm-up, the other two one run of 30 seconds after a 5 second warm-up. Each session used a build of ghoti-bench from before its scripts were merged, so a run from `main` can differ slightly.
 
-To try a scenario on your own machine, `ghoti-bench run --ghoti-ref v0.3.0 --scenario counter-hot` starts the server itself. Numbers from one host are only good for comparing commits, because the server and the benchmark compete for the same CPU.
+Latency with one connection depends on the network between the two instances you get, so expect a different round trip than the one here. The time inside Ghoti does not depend on it.
 
 ## How the results were obtained
 
-- **Hosts.** Two instances in the same subnet of one availability zone, on Amazon Linux 2023. The server is a t4g.micro (2 Graviton2 cores, 1 GiB), or a t4g.small (2 cores, 2 GiB) where it says so, with unlimited CPU credits so it is never throttled. The load comes from a c7g.xlarge (4 Graviton3 cores), much bigger than the server so the benchmark is not what is being measured.
-- **Server.** The released Ghoti binary for linux/arm64, checked against the release checksums, with log level warn and metrics enabled. It has simple memory slots 000-099, and atomic counters 100-199 and token buckets 200 and 300-399 in the sessions that used them.
+- **Hosts.** Two instances in the same subnet of one availability zone in us-west-2, on Amazon Linux 2023. The server is a t4g.micro (2 Graviton2 cores, 1 GiB) with unlimited CPU credits so it is never throttled. The load comes from a c7g.xlarge (4 Graviton3 cores), much bigger than the server so the benchmark is not what is being measured.
+- **Server.** The released Ghoti v0.3.0 binary for linux/arm64, checked against the release checksums, with log level warn and metrics enabled. It has simple memory slots 000-099, and atomic counters 100-199 and token buckets 200 and 300-399 in the sessions that used them.
 - **Load.** Every connection is opened before the run and stays open. Requests and their expected answers are prepared before the run, so the benchmark does no work per request beyond sending it and checking the answer. A warm-up runs first and is not measured.
-- **Latency.** Every round trip is recorded in a histogram with 3 significant digits. p50 is the time half of the requests stay under, p99 the time 99% of them stay under. The maximum is exact.
-- **Validity.** A run only counts if every connection stayed open for the whole run, there were no errors at all, the correctness checks passed and the benchmark used less than 80% of its CPU. The most it used in any run here was 42.2%.
+- **Latency.** Every round trip is recorded on the client in a histogram with 3 significant digits. The maximum is exact. The time inside Ghoti comes from Ghoti's Prometheus histogram, whose buckets start at 50 µs.
+- **Validity.** A run only counts if every connection stayed open for the whole run, there were no errors at all, the correctness checks passed and the benchmark used less than 80% of its CPU.
 
 ## All results
 
-The median of the valid runs for every case. Spread is half the range of the runs relative to the median, and max is the slowest round trip of any run.
+Ghoti v0.3.0 on a t4g.micro. The median of the valid runs for every case. Max is the slowest round trip of any run.
 
-### Throughput
-
-|Scenario |Version and server |Connections |Runs |Requests per second |Lowest and highest run |Spread |Server CPU |Errors |
-|---|---|--:|--:|--:|--:|--:|--:|--:|
-|memory-read |v0.2.0 on t4g.micro |1 |3 |7,964 |7,925 to 8,286 |2.3% |26.6% |0 |
-|memory-read |v0.2.0 on t4g.micro |100 |3 |78,185 |77,758 to 79,338 |1.0% |96.2% |0 |
-|memory-read |v0.2.0 on t4g.micro |1,000 |3 |63,186 |63,152 to 63,725 |0.5% |91.7% |0 |
-|memory-read |v0.2.0 on t4g.small |1 |3 |3,812 |3,793 to 3,851 |0.8% |13.3% |0 |
-|memory-read |v0.2.0 on t4g.small |100 |3 |80,291 |80,206 to 80,614 |0.3% |95.4% |0 |
-|memory-read |v0.2.0 on t4g.small |1,000 |3 |64,896 |64,819 to 64,928 |0.1% |91.5% |0 |
-|memory-read |v0.3.0 on t4g.micro |1 |3 |3,359 |3,095 to 3,420 |4.8% |6.1% |0 |
-|memory-read |v0.3.0 on t4g.micro |100 |3 |134,343 |132,398 to 136,914 |1.7% |82.5% |0 |
-|memory-read |v0.3.0 on t4g.micro |1,000 |3 |112,647 |110,630 to 113,507 |1.3% |89.3% |0 |
-|counter-hot |v0.3.0 on t4g.micro |1 |1 |3,453 |- |- |6.0% |0 |
-|counter-hot |v0.3.0 on t4g.micro |100 |1 |127,594 |- |- |78.1% |0 |
-|counter-hot |v0.3.0 on t4g.micro |1,000 |1 |110,026 |- |- |88.0% |0 |
-|counter-spread |v0.3.0 on t4g.micro |1 |1 |3,320 |- |- |5.9% |0 |
-|counter-spread |v0.3.0 on t4g.micro |100 |1 |134,746 |- |- |82.9% |0 |
-|counter-spread |v0.3.0 on t4g.micro |1,000 |1 |112,955 |- |- |89.7% |0 |
-|token-bucket-hot |v0.3.0 on t4g.micro |1 |1 |3,996 |- |- |6.9% |0 |
-|token-bucket-hot |v0.3.0 on t4g.micro |100 |1 |139,552 |- |- |85.9% |0 |
-|token-bucket-hot |v0.3.0 on t4g.micro |1,000 |1 |113,173 |- |- |89.3% |0 |
-|token-bucket-spread |v0.3.0 on t4g.micro |1 |1 |3,957 |- |- |7.0% |0 |
-|token-bucket-spread |v0.3.0 on t4g.micro |100 |1 |139,188 |- |- |86.3% |0 |
-|token-bucket-spread |v0.3.0 on t4g.micro |1,000 |1 |113,062 |- |- |90.0% |0 |
-
-### Latency
-
-|Scenario |Version and server |Connections |p50 ms |p99 ms |p99.9 ms |max ms |
-|---|---|--:|--:|--:|--:|--:|
-|memory-read |v0.2.0 on t4g.micro |1 |0.121 |0.196 |0.353 |7.486 |
-|memory-read |v0.2.0 on t4g.micro |100 |1.026 |5.304 |8.684 |217.382 |
-|memory-read |v0.2.0 on t4g.micro |1,000 |14.926 |33.243 |40.337 |240.178 |
-|memory-read |v0.2.0 on t4g.small |1 |0.257 |0.332 |0.544 |10.577 |
-|memory-read |v0.2.0 on t4g.small |100 |1.015 |5.095 |8.315 |27.378 |
-|memory-read |v0.2.0 on t4g.small |1,000 |14.533 |32.670 |39.485 |258.661 |
-|memory-read |v0.3.0 on t4g.micro |1 |0.290 |0.372 |0.597 |16.829 |
-|memory-read |v0.3.0 on t4g.micro |100 |0.600 |3.541 |7.123 |57.185 |
-|memory-read |v0.3.0 on t4g.micro |1,000 |8.376 |18.694 |26.231 |255.356 |
-|counter-hot |v0.3.0 on t4g.micro |1 |0.282 |0.368 |0.747 |9.754 |
-|counter-hot |v0.3.0 on t4g.micro |100 |0.628 |4.053 |8.864 |74.566 |
-|counter-hot |v0.3.0 on t4g.micro |1,000 |8.552 |19.300 |36.078 |71.779 |
-|counter-spread |v0.3.0 on t4g.micro |1 |0.294 |0.369 |0.552 |5.697 |
-|counter-spread |v0.3.0 on t4g.micro |100 |0.602 |3.494 |7.881 |51.752 |
-|counter-spread |v0.3.0 on t4g.micro |1,000 |8.385 |17.990 |24.789 |32.151 |
-|token-bucket-hot |v0.3.0 on t4g.micro |1 |0.242 |0.332 |0.681 |10.764 |
-|token-bucket-hot |v0.3.0 on t4g.micro |100 |0.588 |3.379 |7.803 |65.059 |
-|token-bucket-hot |v0.3.0 on t4g.micro |1,000 |8.339 |18.711 |26.329 |223.583 |
-|token-bucket-spread |v0.3.0 on t4g.micro |1 |0.242 |0.368 |0.719 |8.952 |
-|token-bucket-spread |v0.3.0 on t4g.micro |100 |0.591 |3.238 |7.520 |27.378 |
-|token-bucket-spread |v0.3.0 on t4g.micro |1,000 |8.397 |17.842 |25.068 |222.237 |
+|Scenario |Connections |Runs |Requests per second |p50 ms |p90 ms |p99 ms |p99.9 ms |max ms |Server CPU |Errors |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+|memory-read |1 |3 |3,359 |0.290 |0.322 |0.372 |0.597 |16.829 |6% |0 |
+|memory-read |100 |3 |134,343 |0.600 |1.101 |3.541 |7.123 |57.185 |82% |0 |
+|memory-read |1,000 |3 |112,647 |8.376 |11.190 |18.694 |26.231 |255.356 |89% |0 |
+|counter-hot |1 |1 |3,453 |0.282 |0.309 |0.368 |0.747 |9.754 |6% |0 |
+|counter-hot |100 |1 |127,594 |0.628 |1.168 |4.053 |8.864 |74.566 |78% |0 |
+|counter-hot |1,000 |1 |110,026 |8.552 |11.502 |19.300 |36.078 |71.779 |88% |0 |
+|counter-spread |1 |1 |3,320 |0.294 |0.321 |0.369 |0.552 |5.697 |6% |0 |
+|counter-spread |100 |1 |134,746 |0.602 |1.092 |3.494 |7.881 |51.752 |83% |0 |
+|counter-spread |1,000 |1 |112,955 |8.385 |11.133 |17.990 |24.789 |32.151 |90% |0 |
+|token-bucket-hot |1 |1 |3,996 |0.242 |0.274 |0.332 |0.681 |10.764 |7% |0 |
+|token-bucket-hot |100 |1 |139,552 |0.588 |1.075 |3.379 |7.803 |65.059 |86% |0 |
+|token-bucket-hot |1,000 |1 |113,173 |8.339 |11.174 |18.711 |26.329 |223.583 |89% |0 |
+|token-bucket-spread |1 |1 |3,957 |0.242 |0.286 |0.368 |0.719 |8.952 |7% |0 |
+|token-bucket-spread |100 |1 |139,188 |0.591 |1.081 |3.238 |7.520 |27.378 |86% |0 |
+|token-bucket-spread |1,000 |1 |113,062 |8.397 |11.035 |17.842 |25.068 |222.237 |90% |0 |
